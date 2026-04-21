@@ -1,0 +1,433 @@
+"""Pixel-accurate export: render subtitle overlay frames in headless Chromium,
+combine with source video/audio via ffmpeg.
+
+Replaces the old libass-based burn for the goal of preview = export parity.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import shlex
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+from typing import Callable, Iterable, Optional
+
+from playwright.async_api import async_playwright
+
+from .canvas import hex_to_ffmpeg_color
+from .models import Canvas, Position, Segment, Size, Style
+from .overlay_timing import compute_overlay_change_times
+
+log = logging.getLogger(__name__)
+
+ProgressCb = Callable[[int], None]
+
+RENDER_FPS = 30
+RENDER_URL = "http://127.0.0.1:8000/?render=1"
+
+
+def _build_render_state(
+    segments: list[Segment],
+    style: Style,
+    position: Position,
+    size: Size,
+    canvas: Canvas,
+    target_w: int,
+    target_h: int,
+    duration: float,
+    is_audio_only: bool,
+    watermark: bool = False,
+) -> dict:
+    return {
+        "dims": {"w": target_w, "h": target_h},
+        "segments": [s.model_dump() for s in segments],
+        "style": style.model_dump(),
+        "position": position.model_dump(),
+        "size": size.model_dump(),
+        "canvas": canvas.model_dump(),
+        "duration": duration,
+        "videoW": target_w,
+        "videoH": target_h,
+        "isAudioOnly": is_audio_only,
+        "watermark": watermark,
+    }
+
+
+def _dedup_enabled() -> bool:
+    return os.environ.get("CUTSTORM_DEDUP", "1") != "0"
+
+
+async def _capture_frames(
+    state: dict,
+    target_w: int,
+    target_h: int,
+    duration: float,
+    fps: int,
+    segments: list[Segment],
+    style: Style,
+    on_frame: Callable[[bytes], None],
+    on_progress: Optional[ProgressCb] = None,
+) -> int:
+    """Drive headless Chromium, yield PNG bytes per frame via on_frame.
+
+    Renders one PNG per stable overlay-content interval instead of per frame:
+    `compute_overlay_change_times` gives the timestamps at which the overlay
+    actually changes. Between adjacent points the PNG is identical, so we
+    re-emit the cached bytes to ffmpeg's stdin for every frame in that
+    interval. Set `CUTSTORM_DEDUP=0` to force the old per-frame render path.
+    """
+    total_frames = max(1, int(round(duration * fps)))
+    last_pct = -10
+
+    if _dedup_enabled():
+        change_times = compute_overlay_change_times(segments, style, duration)
+    else:
+        # Legacy per-frame path: every frame timestamp is its own change point.
+        change_times = [i / fps for i in range(total_frames)] + [duration]
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(args=["--no-sandbox"])
+        context = await browser.new_context(
+            viewport={"width": target_w, "height": target_h},
+            device_scale_factor=1,
+        )
+        page = await context.new_page()
+        await page.goto(RENDER_URL, wait_until="networkidle")
+        await page.evaluate(
+            "(s) => { window.__setRenderState(s); }",
+            state,
+        )
+        await page.wait_for_selector('[data-testid="render-canvas"]')
+        # Give fonts a beat to load (fontsource uses @font-face).
+        await page.evaluate("() => document.fonts.ready")
+
+        ci = 0
+        cached_png: bytes | None = None
+        last_rendered_at: float = -1.0
+        renders = 0
+        reuses = 0
+
+        for i in range(total_frames):
+            t = i / fps
+            while ci + 1 < len(change_times) and change_times[ci + 1] <= t:
+                ci += 1
+            render_at = change_times[ci]
+
+            if cached_png is None or render_at != last_rendered_at:
+                await page.evaluate(f"window.__setFrameTime({render_at})")
+                await page.wait_for_function(
+                    "() => window.__renderReady === true",
+                    timeout=5000,
+                )
+                cached_png = await page.screenshot(
+                    omit_background=True,
+                    type="png",
+                    full_page=False,
+                    animations="disabled",
+                )
+                last_rendered_at = render_at
+                renders += 1
+            else:
+                reuses += 1
+
+            on_frame(cached_png)
+            if on_progress is not None:
+                pct = int(i / total_frames * 100)
+                if pct >= last_pct + 5:
+                    on_progress(min(99, pct))
+                    last_pct = pct
+        log.info(
+            "renderer.dedup renders=%d reuses=%d total_frames=%d change_points=%d",
+            renders, reuses, total_frames, len(change_times),
+        )
+        await browser.close()
+    return total_frames
+
+
+def _ffmpeg_cmd_video(
+    source: Path,
+    out: Path,
+    target_w: int,
+    target_h: int,
+    fps: int,
+    canvas_filter: str,
+    select_expr: str | None,
+    trim_in: float = 0.0,
+    trim_duration: float | None = None,
+    source_volume: float = 1.0,
+    extra_audio: Path | None = None,
+    extra_volume: float = 1.0,
+    source_has_audio: bool = True,
+) -> list[str]:
+    """Build ffmpeg for: source video → scale/crop + overlay PNG stream + audio."""
+    # Source video gets canvas_filter (crop/scale/pad) then overlay.
+    # If select_expr (trim silences) — applied before canvas_filter.
+    # canvas_filter already scales to target dims when needed; only add an
+    # explicit scale if it's empty (no canvas transform at all).
+    pre = ""
+    if select_expr:
+        pre = f"select='{select_expr}',setpts=N/FRAME_RATE/TB,"
+    if canvas_filter:
+        chain = f"[0:v]{pre}{canvas_filter}[bg]"
+    else:
+        chain = f"[0:v]{pre}scale={target_w}:{target_h}[bg]"
+
+    has_extra = extra_audio is not None
+    # Branches that touch [0:a] must be gated on source_has_audio — otherwise
+    # ffmpeg blows up with "stream specifier ':a' matches no streams" on
+    # muted source videos (screen-recording etc).
+    needs_audio_encode = (
+        has_extra
+        or (source_has_audio and abs(source_volume - 1.0) > 1e-3)
+        or (source_has_audio and select_expr is not None)
+    )
+
+    if select_expr and source_has_audio:
+        src_audio = f"[0:a]aselect='{select_expr}',asetpts=N/SR/TB,volume={source_volume:.3f}"
+    else:
+        src_audio = f"[0:a]volume={source_volume:.3f}"
+
+    if has_extra and source_has_audio:
+        # overlay input is index 1 (image2pipe); extra audio is index 2.
+        audio_chain = (
+            f";{src_audio}[a0];[2:a]volume={extra_volume:.3f}[a1];"
+            f"[a0][a1]amix=inputs=2:duration=first:normalize=0[a]"
+        )
+        audio_map = ["-map", "[a]"]
+        acopy = ["-c:a", "aac", "-b:a", "128k"]
+    elif has_extra:
+        # Source is silent — extra is the only audio.
+        audio_chain = f";[2:a]volume={extra_volume:.3f}[a]"
+        audio_map = ["-map", "[a]"]
+        acopy = ["-c:a", "aac", "-b:a", "128k"]
+    elif source_has_audio and needs_audio_encode:
+        audio_chain = f";{src_audio}[a]"
+        audio_map = ["-map", "[a]"]
+        acopy = ["-c:a", "aac", "-b:a", "128k"]
+    elif source_has_audio:
+        audio_chain = ""
+        audio_map = ["-map", "0:a?"]
+        acopy = ["-c:a", "copy"]
+    else:
+        # No source audio and no extra — silent output, skip audio mapping.
+        audio_chain = ""
+        audio_map = ["-an"]
+        acopy = []
+    filter_complex = f"{chain};[bg][1:v]overlay=format=auto[v]{audio_chain}"
+
+    cmd = ["ffmpeg", "-y", "-nostats", "-loglevel", "error"]
+    if trim_in > 0.0:
+        cmd += ["-ss", f"{trim_in:.3f}"]
+    if trim_duration is not None and trim_duration > 0.0:
+        cmd += ["-t", f"{trim_duration:.3f}"]
+    cmd += ["-i", str(source)]
+    cmd += [
+        "-f", "image2pipe",
+        "-framerate", str(fps),
+        "-i", "pipe:0",
+    ]
+    if has_extra:
+        if trim_duration is not None and trim_duration > 0.0:
+            cmd += ["-t", f"{trim_duration:.3f}"]
+        cmd += ["-i", str(extra_audio)]
+    cmd += [
+        "-filter_complex", filter_complex,
+        "-map", "[v]",
+        *audio_map,
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-preset", "veryfast",
+        "-crf", "20",
+        *acopy,
+        "-shortest",
+        str(out),
+    ]
+    return cmd
+
+
+def _ffmpeg_cmd_audio_only(
+    audio: Path,
+    out: Path,
+    target_w: int,
+    target_h: int,
+    fps: int,
+    bg_color: str,
+    duration: float,
+    select_expr: str | None,
+    trim_in: float = 0.0,
+    trim_duration: float | None = None,
+    source_volume: float = 1.0,
+    extra_audio: Path | None = None,
+    extra_volume: float = 1.0,
+) -> list[str]:
+    """Build ffmpeg for: synthetic color bg + audio + overlay PNG stream."""
+    ff_color = hex_to_ffmpeg_color(bg_color)
+    color_input = f"color=c={ff_color}:s={target_w}x{target_h}:r={fps}:d={duration:.3f}"
+
+    has_extra = extra_audio is not None
+
+    if select_expr:
+        src_audio = f"[1:a]aselect='{select_expr}',asetpts=N/SR/TB,volume={source_volume:.3f}"
+    else:
+        src_audio = f"[1:a]volume={source_volume:.3f}"
+
+    # Inputs: 0=color, 1=audio, 2=image2pipe, [3=extra]
+    if has_extra:
+        audio_chain = (
+            f"{src_audio}[a0];[3:a]volume={extra_volume:.3f}[a1];"
+            f"[a0][a1]amix=inputs=2:duration=first:normalize=0[a]"
+        )
+    else:
+        audio_chain = f"{src_audio}[a]"
+    audio_map = ["-map", "[a]"]
+
+    filter_complex = f"[0:v][2:v]overlay=format=auto[v];{audio_chain}"
+
+    cmd = ["ffmpeg", "-y", "-nostats", "-loglevel", "error",
+           "-f", "lavfi", "-i", color_input]
+    if trim_in > 0.0:
+        cmd += ["-ss", f"{trim_in:.3f}"]
+    if trim_duration is not None and trim_duration > 0.0:
+        cmd += ["-t", f"{trim_duration:.3f}"]
+    cmd += ["-i", str(audio),
+            "-f", "image2pipe",
+            "-framerate", str(fps),
+            "-i", "pipe:0"]
+    if has_extra:
+        if trim_duration is not None and trim_duration > 0.0:
+            cmd += ["-t", f"{trim_duration:.3f}"]
+        cmd += ["-i", str(extra_audio)]
+    cmd += [
+        "-filter_complex", filter_complex,
+        "-map", "[v]",
+        *audio_map,
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-preset", "veryfast",
+        "-crf", "20",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-shortest",
+        str(out),
+    ]
+    return cmd
+
+
+def render_export(
+    source: Path,
+    out: Path,
+    target_w: int,
+    target_h: int,
+    canvas: Canvas,
+    canvas_filter: str,
+    segments: list[Segment],
+    style: Style,
+    position: Position,
+    size: Size,
+    duration: float,
+    is_audio_only: bool,
+    select_expr: str | None = None,
+    on_progress: Optional[ProgressCb] = None,
+    fps: int = RENDER_FPS,
+    trim_in: float = 0.0,
+    trim_duration: float | None = None,
+    source_volume: float = 1.0,
+    extra_audio: Path | None = None,
+    extra_volume: float = 1.0,
+    watermark: bool = False,
+    source_has_audio: bool = True,
+) -> None:
+    """Synchronous entry. Runs Playwright frame capture + ffmpeg pipe.
+
+    Intended to be called via asyncio.to_thread from async FastAPI handler.
+    """
+    out.parent.mkdir(parents=True, exist_ok=True)
+    state = _build_render_state(
+        segments, style, position, size, canvas,
+        target_w, target_h, duration, is_audio_only,
+        watermark=watermark,
+    )
+
+    if is_audio_only:
+        cmd = _ffmpeg_cmd_audio_only(
+            audio=source, out=out,
+            target_w=target_w, target_h=target_h, fps=fps,
+            bg_color=canvas.bg_color, duration=duration,
+            select_expr=select_expr,
+            trim_in=trim_in, trim_duration=trim_duration,
+            source_volume=source_volume,
+            extra_audio=extra_audio, extra_volume=extra_volume,
+        )
+    else:
+        cmd = _ffmpeg_cmd_video(
+            source=source, out=out,
+            target_w=target_w, target_h=target_h, fps=fps,
+            canvas_filter=canvas_filter,
+            select_expr=select_expr,
+            trim_in=trim_in, trim_duration=trim_duration,
+            source_volume=source_volume,
+            extra_audio=extra_audio, extra_volume=extra_volume,
+            source_has_audio=source_has_audio,
+        )
+    log.info("renderer.ffmpeg cmd=%s", shlex.join(cmd))
+
+    # stderr → tempfile (not PIPE) so ffmpeg's output doesn't deadlock us
+    # when the OS pipe buffer fills up. We read it at the end for diagnostics.
+    stderr_file = tempfile.TemporaryFile(mode="w+b")
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=stderr_file,
+    )
+    assert proc.stdin is not None
+
+    frames_written = {"n": 0}
+
+    def on_frame(png: bytes) -> None:
+        try:
+            proc.stdin.write(png)
+            frames_written["n"] += 1
+        except BrokenPipeError:
+            raise
+
+    async def _drive() -> int:
+        return await _capture_frames(
+            state=state,
+            target_w=target_w,
+            target_h=target_h,
+            duration=duration,
+            fps=fps,
+            segments=segments,
+            style=style,
+            on_frame=on_frame,
+            on_progress=on_progress,
+        )
+
+    err_tail = ""
+    try:
+        total = asyncio.run(_drive())
+        proc.stdin.close()
+        log.info("renderer.frames piped=%d total=%d — waiting for ffmpeg mux", frames_written["n"], total)
+        proc.wait()
+        log.info("renderer.ffmpeg exit=%d", proc.returncode)
+    except Exception:
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        raise
+    finally:
+        stderr_file.seek(0)
+        err_tail = stderr_file.read().decode("utf-8", errors="replace")[-3000:]
+        stderr_file.close()
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed (code {proc.returncode}):\n{err_tail}")
+    if on_progress is not None:
+        on_progress(100)

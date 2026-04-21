@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 140" width="760" height="140">
+  <defs>
+    
+    <pattern id="scan-d" width="4" height="4" patternUnits="userSpaceOnUse">
+      <rect width="4" height="2.2" fill="#f6f4ef"></rect>
+      <rect y="2.2" width="4" height="1.8" fill="#0f0e0d"></rect>
+    </pattern>
+    <mask id="wmd">
+      <text x="0" y="110" class="wm" fill="#fff">Cut/Storm</text>
+    </mask>
+  </defs>
+  <rect x="0" y="0" width="760" height="140" fill="url(#scan-d)" mask="url(#wmd)"></rect>
+</svg>

@@ -1,0 +1,115 @@
+{
+  "_comment": "Edit this file to change which fonts ship in the container. Each entry points at a path under github.com/google/fonts. On build, fonts/build.sh downloads the listed files and fontconfig indexes them. Files in fonts/custom/ are copied alongside without downloading (use this for your own TTF/OTF).",
+
+  "fonts": [
+    {
+      "family": "Bebas Neue",
+      "category": "display",
+      "scripts": ["latin", "cyrillic"],
+      "license_dir": "ofl",
+      "slug": "bebasneue",
+      "files": ["BebasNeue-Regular.ttf"]
+    },
+    {
+      "family": "Oswald",
+      "category": "display",
+      "scripts": ["latin", "cyrillic"],
+      "license_dir": "ofl",
+      "slug": "oswald",
+      "files": ["Oswald[wght].ttf"]
+    },
+    {
+      "family": "Anton",
+      "category": "display",
+      "scripts": ["latin", "cyrillic"],
+      "license_dir": "ofl",
+      "slug": "anton",
+      "files": ["Anton-Regular.ttf"]
+    },
+    {
+      "family": "Bangers",
+      "category": "display",
+      "scripts": ["latin"],
+      "license_dir": "ofl",
+      "slug": "bangers",
+      "files": ["Bangers-Regular.ttf"]
+    },
+
+    {
+      "family": "Inter",
+      "category": "sans",
+      "scripts": ["latin", "cyrillic"],
+      "license_dir": "ofl",
+      "slug": "inter",
+      "files": ["Inter[opsz,wght].ttf"]
+    },
+    {
+      "family": "Roboto",
+      "category": "sans",
+      "scripts": ["latin", "cyrillic"],
+      "license_dir": "ofl",
+      "slug": "roboto",
+      "files": ["Roboto[wdth,wght].ttf"]
+    },
+    {
+      "family": "IBM Plex Sans",
+      "category": "sans",
+      "scripts": ["latin", "cyrillic"],
+      "license_dir": "ofl",
+      "slug": "ibmplexsans",
+      "files": ["IBMPlexSans[wdth,wght].ttf"]
+    },
+
+    {
+      "family": "Montserrat",
+      "category": "geometric",
+      "scripts": ["latin", "cyrillic"],
+      "license_dir": "ofl",
+      "slug": "montserrat",
+      "files": ["Montserrat[wght].ttf"]
+    },
+    {
+      "family": "Manrope",
+      "category": "geometric",
+      "scripts": ["latin", "cyrillic"],
+      "license_dir": "ofl",
+      "slug": "manrope",
+      "files": ["Manrope[wght].ttf"]
+    },
+
+    {
+      "family": "Playfair Display",
+      "category": "serif",
+      "scripts": ["latin", "cyrillic"],
+      "license_dir": "ofl",
+      "slug": "playfairdisplay",
+      "files": ["PlayfairDisplay[wght].ttf"]
+    },
+    {
+      "family": "Merriweather",
+      "category": "serif",
+      "scripts": ["latin", "cyrillic"],
+      "license_dir": "ofl",
+      "slug": "merriweather",
+      "files": ["Merriweather[opsz,wdth,wght].ttf"]
+    },
+
+    {
+      "family": "Caveat",
+      "category": "handwritten",
+      "scripts": ["latin", "cyrillic"],
+      "license_dir": "ofl",
+      "slug": "caveat",
+      "files": ["Caveat[wght].ttf"]
+    },
+
+    {
+      "family": "Noto Sans SC",
+      "category": "cjk",
+      "scripts": ["cjk"],
+      "license_dir": "ofl",
+      "slug": "notosanssc",
+      "files": ["NotoSansSC[wght].ttf"]
+    }
+  ]
+}

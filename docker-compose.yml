@@ -1,0 +1,32 @@
+name: cutstorm
+
+services:
+  app:
+    build:
+      context: .
+      target: runtime
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+    environment:
+      # Default model is loaded into RAM on container startup (warmup).
+      # Must match what the frontend requests by default so the first
+      # transcribe hits cached model.
+      WHISPER_MODEL: large-v3
+      WHISPER_COMPUTE: int8
+      WHISPER_DEVICE: cpu
+
+  test:
+    build:
+      context: .
+      target: test
+    profiles: ["test"]
+    volumes:
+      - ./data:/data
+    environment:
+      WHISPER_MODEL: tiny
+      WHISPER_COMPUTE: int8
+      WHISPER_DEVICE: cpu
+      WHISPERX_SKIP_ALIGN: "1"
+    command: ["/scripts/docker-test.sh"]
