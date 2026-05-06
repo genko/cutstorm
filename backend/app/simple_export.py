@@ -60,7 +60,7 @@ def run_filter_only(
     """Case B: canvas transform and/or trim, but no subtitle overlay.
 
     Re-encodes video through the same libx264 settings as the renderer path
-    (crf=20, preset=veryfast, yuv420p) so outputs stay visually consistent.
+    (crf=16, preset=slow, yuv420p) so outputs stay visually consistent.
 
     `trim_in` / `trim_duration` apply as input-seek on the source input.
     `source_volume` / `extra_audio` / `extra_volume` apply an audio mix.
@@ -110,14 +110,14 @@ def run_filter_only(
     if has_extra and source_has_audio:
         # Mix source + extra.
         filter_complex += f";{src_audio}[a0];[1:a]volume={extra_volume:.3f}[a1];[a0][a1]amix=inputs=2:duration=first:normalize=0[a]"
-        audio_map = ["-map", "[a]", "-c:a", "aac", "-b:a", "128k"]
+        audio_map = ["-map", "[a]", "-c:a", "aac", "-b:a", "192k"]
     elif has_extra:
         # Source is silent — extra becomes the only audio stream.
         filter_complex += f";[1:a]volume={extra_volume:.3f}[a]"
-        audio_map = ["-map", "[a]", "-c:a", "aac", "-b:a", "128k"]
+        audio_map = ["-map", "[a]", "-c:a", "aac", "-b:a", "192k"]
     elif source_has_audio and needs_audio_encode:
         filter_complex += f";{src_audio}[a]"
-        audio_map = ["-map", "[a]", "-c:a", "aac", "-b:a", "128k"]
+        audio_map = ["-map", "[a]", "-c:a", "aac", "-b:a", "192k"]
     elif source_has_audio:
         # No processing needed — copy source audio stream through.
         audio_map = ["-map", "0:a?", "-c:a", "copy"]
@@ -144,8 +144,8 @@ def run_filter_only(
         "-map", "[v]", *audio_map,
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
-        "-preset", "veryfast",
-        "-crf", "20",
+        "-preset", "slow",
+        "-crf", "16",
     ]
     # -shortest stops encoding when the shortest input ends; otherwise the
     # looped watermark PNG would extend the video forever.

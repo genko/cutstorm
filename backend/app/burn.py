@@ -32,8 +32,8 @@ def run(
         "-vf", filter_arg,
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
-        "-preset", "veryfast",
-        "-crf", "20",
+        "-preset", "slow",
+        "-crf", "16",
         "-c:a", "copy",
         str(out),
     ]
@@ -70,10 +70,10 @@ def run_with_cuts(
         "-map", "[a]",
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
-        "-preset", "veryfast",
-        "-crf", "20",
+        "-preset", "slow",
+        "-crf", "16",
         "-c:a", "aac",
-        "-b:a", "128k",
+        "-b:a", "192k",
         str(out),
     ]
     _run_ffmpeg(cmd, total_duration, on_progress)
@@ -121,10 +121,10 @@ def run_audio_only(
             "-shortest",
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
-            "-preset", "veryfast",
-            "-crf", "20",
+            "-preset", "slow",
+            "-crf", "16",
             "-c:a", "aac",
-            "-b:a", "128k",
+            "-b:a", "192k",
             str(out),
         ]
     else:
@@ -138,10 +138,10 @@ def run_audio_only(
             "-vf", video_filter,
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
-            "-preset", "veryfast",
-            "-crf", "20",
+            "-preset", "slow",
+            "-crf", "16",
             "-c:a", "aac",
-            "-b:a", "128k",
+            "-b:a", "192k",
             str(out),
         ]
     _run_ffmpeg(cmd, duration, on_progress)

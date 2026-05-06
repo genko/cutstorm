@@ -16,6 +16,7 @@ services:
       WHISPER_MODEL: large-v3
       WHISPER_COMPUTE: int8
       WHISPER_DEVICE: cpu
+      MAX_UPLOAD_BYTES: "107374182400"
 
   test:
     build:

@@ -198,16 +198,16 @@ def _ffmpeg_cmd_video(
             f"[a0][a1]amix=inputs=2:duration=first:normalize=0[a]"
         )
         audio_map = ["-map", "[a]"]
-        acopy = ["-c:a", "aac", "-b:a", "128k"]
+        acopy = ["-c:a", "aac", "-b:a", "192k"]
     elif has_extra:
         # Source is silent — extra is the only audio.
         audio_chain = f";[2:a]volume={extra_volume:.3f}[a]"
         audio_map = ["-map", "[a]"]
-        acopy = ["-c:a", "aac", "-b:a", "128k"]
+        acopy = ["-c:a", "aac", "-b:a", "192k"]
     elif source_has_audio and needs_audio_encode:
         audio_chain = f";{src_audio}[a]"
         audio_map = ["-map", "[a]"]
-        acopy = ["-c:a", "aac", "-b:a", "128k"]
+        acopy = ["-c:a", "aac", "-b:a", "192k"]
     elif source_has_audio:
         audio_chain = ""
         audio_map = ["-map", "0:a?"]
@@ -240,8 +240,8 @@ def _ffmpeg_cmd_video(
         *audio_map,
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
-        "-preset", "veryfast",
-        "-crf", "20",
+        "-preset", "slow",
+        "-crf", "16",
         *acopy,
         "-shortest",
         str(out),
@@ -307,10 +307,10 @@ def _ffmpeg_cmd_audio_only(
         *audio_map,
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
-        "-preset", "veryfast",
-        "-crf", "20",
+        "-preset", "slow",
+        "-crf", "16",
         "-c:a", "aac",
-        "-b:a", "128k",
+        "-b:a", "192k",
         "-shortest",
         str(out),
     ]
