@@ -4,6 +4,7 @@ from typing import Iterable
 
 from .ass_builder import _words_or_synth
 from .models import Segment, Style
+from .sentence_chunks import chunks_by_sentence
 
 
 def compute_overlay_change_times(
@@ -34,7 +35,7 @@ def compute_overlay_change_times(
                 points.add(round(w.start, 3))
         elif style.mode == "word":
             ws = _words_or_synth(seg)
-            chunk = max(1, style.words_per_chunk)
-            for i in range(0, len(ws), chunk):
-                points.add(round(ws[i].start, 3))
+            chunk_size = max(1, style.words_per_chunk)
+            for chunk in chunks_by_sentence(ws, chunk_size):
+                points.add(round(chunk[0].start, 3))
     return sorted(p for p in points if p >= 0.0)

@@ -1,6 +1,7 @@
 import { CSSProperties, ReactNode, useEffect, useRef, useState } from "react";
 import { Segment, Word, useStore } from "../store";
 import { styleToCss } from "../styleToCss";
+import { chunksBySentence } from "../sentenceChunks";
 
 type Props = {
   videoRef: React.RefObject<HTMLMediaElement>;
@@ -51,16 +52,29 @@ export function SubtitleOverlay({ videoRef, renderMode = false, currentTimeOverr
   const size = useStore((s) => s.size);
   const setPosition = useStore((s) => s.setPosition);
   const setSize = useStore((s) => s.setSize);
+  const subtitleTrack = useStore((s) => s.subtitleTrack);
+  const trimRange = useStore((s) => s.trimRange);
+  const extraAudioId = useStore((s) => s.audio.extraAudioId);
+  const extraAudioDuration = useStore((s) => s.audio.extraAudioDuration);
+  const storeCurrentTime = useStore((s) => s.currentTime);
 
   const [currentTime, setLocalTime] = useState(0);
   const dragRef = useRef<DragMode>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
+
+  const trimOut = trimRange.out_sec > 0 ? trimRange.out_sec : 0;
+  const loopClipDuration = Math.max(0, trimOut - trimRange.in_sec);
+  const loopActive = !!trimRange.loop
+    && extraAudioId !== null
+    && extraAudioDuration > 0
+    && loopClipDuration > 0;
 
   // requestAnimationFrame loop while playing → smooth karaoke updates
   // (~16 ms granularity), independent of the browser's lazy `timeupdate`
   // which fires only every ~250 ms and skips short words.
   useEffect(() => {
     if (renderMode) return; // offline render: no rAF, time comes from prop
+    if (loopActive) return; // loop branch reads master from the store.
     const v = videoRef.current;
     if (!v) return;
     let raf = 0;
@@ -91,9 +105,26 @@ export function SubtitleOverlay({ videoRef, renderMode = false, currentTimeOverr
       v.removeEventListener("pause", stop);
       v.removeEventListener("ended", stop);
     };
-  }, [videoRef, renderMode]);
+  }, [videoRef, renderMode, loopActive]);
 
-  const effectiveTime = renderMode ? (currentTimeOverride ?? 0) : currentTime;
+  // In loop mode the master clock is the extra <audio>; the VideoPreview
+  // rAF loop publishes it to the store as `currentTime`. Mirror it here.
+  useEffect(() => {
+    if (!loopActive || renderMode) return;
+    setLocalTime(storeCurrentTime);
+  }, [loopActive, renderMode, storeCurrentTime]);
+
+  // Map the master clock onto the timeline of the active subtitle track:
+  // - extra subs ride the master extra-audio timeline (0..extraDur).
+  // - source subs (loop=ON) need phase mapping: master mod loopClipDur,
+  //   then offset by trim_in to land in the original video's coordinates.
+  // - source subs (loop=OFF) read the video's currentTime directly.
+  const masterTime = renderMode ? (currentTimeOverride ?? 0) : currentTime;
+  let effectiveTime = masterTime;
+  if (loopActive && subtitleTrack === "source" && loopClipDuration > 0) {
+    const phase = ((masterTime % loopClipDuration) + loopClipDuration) % loopClipDuration;
+    effectiveTime = trimRange.in_sec + phase;
+  }
 
   function parentRect(): { w: number; h: number } | null {
     const parent = overlayRef.current?.parentElement;
@@ -198,15 +229,12 @@ export function SubtitleOverlay({ videoRef, renderMode = false, currentTimeOverr
       const chunkSize = Math.max(1, style.words_per_chunk);
       // Build all chunks, then pick the latest one whose start <= effectiveTime.
       // Same anti-skip logic as karaoke — guarantees no chunk is missed.
-      const chunks: { start: number; end: number; text: string }[] = [];
-      for (let i = 0; i < words.length; i += chunkSize) {
-        const c = words.slice(i, i + chunkSize);
-        chunks.push({
+      const chunks: { start: number; end: number; text: string }[] =
+        chunksBySentence(words, chunkSize).map((c) => ({
           start: c[0].start,
           end: c[c.length - 1].end,
           text: c.map((w) => w.text).join(" "),
-        });
-      }
+        }));
       let activeChunkIdx = -1;
       for (let i = 0; i < chunks.length; i++) {
         if (chunks[i].start <= effectiveTime) activeChunkIdx = i;
@@ -223,10 +251,7 @@ export function SubtitleOverlay({ videoRef, renderMode = false, currentTimeOverr
       // to guarantee smooth highlight with no gaps.
       const words = wordsOf(seg);
       const chunkSize = Math.max(1, style.words_per_chunk);
-      const chunks: typeof words[] = [];
-      for (let i = 0; i < words.length; i += chunkSize) {
-        chunks.push(words.slice(i, i + chunkSize));
-      }
+      const chunks: Word[][] = chunksBySentence(words, chunkSize);
       let activeChunkIdx = -1;
       for (let i = 0; i < chunks.length; i++) {
         if (chunks[i][0].start <= effectiveTime) activeChunkIdx = i;

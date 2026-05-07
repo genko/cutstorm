@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { uploadExtraAudio } from "../api";
+import {
+  cancelTranscribeExtra,
+  transcribeExtra,
+  uploadExtraAudio,
+} from "../api";
 import { clearExtraBlob, getExtraBlob, setExtraBlob } from "../extraBlobs";
+import { newJobId, openProgressWs } from "../progress";
 import { useStore } from "../store";
 import { computePeaks } from "../waveform";
 
@@ -26,6 +31,7 @@ export function Timeline() {
   const audio = useStore((s) => s.audio);
   const setAudio = useStore((s) => s.setAudio);
   const setError = useStore((s) => s.setError);
+  const setLoop = useStore((s) => s.setLoop);
 
   if (!videoUrl || !duration) return null;
 
@@ -35,6 +41,8 @@ export function Timeline() {
   const thumbsUrl = videoId && !isAudioOnly
     ? `/api/thumbnails/${videoId}?count=${THUMB_COUNT}&width=${THUMB_WIDTH}`
     : null;
+  const loopArmed = !!trimRange.loop;
+  const loopActive = loopArmed && audio.extraAudioId !== null && audio.extraAudioDuration > 0;
 
   return (
     <div className="timeline" data-testid="timeline">
@@ -54,6 +62,24 @@ export function Timeline() {
         <span>{fmt(outSec)}</span>
         <span style={{ opacity: 0.4 }}>·</span>
         <span>{kept.toFixed(2)}s kept</span>
+        <span style={{ opacity: 0.4 }}>·</span>
+        <label className="loop-toggle" data-testid="loop-toggle-label" title="Loop the selected slice across the extra audio's full duration (Coub mode)">
+          <input
+            type="checkbox"
+            data-testid="loop-toggle"
+            checked={loopArmed}
+            onChange={(e) => setLoop(e.target.checked)}
+          />
+          <span>Loop</span>
+          {loopActive && (
+            <span className="loop-target" data-testid="loop-target">
+              → {audio.extraAudioDuration.toFixed(1)}s
+            </span>
+          )}
+          {loopArmed && !loopActive && (
+            <span className="loop-hint" data-testid="loop-hint">(needs extra audio)</span>
+          )}
+        </label>
       </div>
 
       {/* tracks temporarily disabled for debugging */}
@@ -251,6 +277,36 @@ function ExtraTrack({
   const extraServerPeaks = useServerExtraPeaks(audio.extraAudioId);
   const decodedPeaks = useWaveform(peakKey, extraBlobUrl);
 
+  const setExtraSegments = useStore((s) => s.setExtraSegments);
+  const setSubtitleTrack = useStore((s) => s.setSubtitleTrack);
+  const setExtraSubsStreaming = useStore((s) => s.setExtraSubsStreaming);
+  const setProgress = useStore((s) => s.setProgress);
+  const setJobId = useStore((s) => s.setJobId);
+  const extraSubsStreaming = useStore((s) => s.extraSubsStreaming);
+  const segmentsExtra = useStore((s) => s.segmentsExtra);
+
+  // After a project reload the store has the extra_audio_id but no name/
+  // duration (those weren't in meta.json). Rehydrate from /info so the
+  // waveform width and the toolbar duration display correctly.
+  useEffect(() => {
+    const id = audio.extraAudioId;
+    if (!id) return;
+    if (audio.extraAudioDuration > 0 && audio.extraAudioName) return;
+    let cancelled = false;
+    fetch(`/api/extra-audio/${encodeURIComponent(id)}/info`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((info) => {
+        if (cancelled || !info) return;
+        setAudio({
+          extraAudioDuration: Number(info.duration) || 0,
+          extraAudioName: audio.extraAudioName ?? `extra.${info.ext ?? "audio"}`,
+        });
+      })
+      .catch(() => { /* network — skip silently, user will see stale 0s */ });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [audio.extraAudioId]);
+
   async function onFile(file: File) {
     setUploading(true);
     setError(null);
@@ -262,6 +318,8 @@ function ExtraTrack({
         extraAudioName: res.name,
         extraAudioDuration: res.duration,
       });
+      // Fresh extra audio invalidates any prior extra-track transcript.
+      setExtraSegments([]);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -272,6 +330,62 @@ function ExtraTrack({
   function clear() {
     if (audio.extraAudioId) clearExtraBlob(audio.extraAudioId);
     setAudio({ extraAudioId: null, extraAudioName: null, extraAudioDuration: 0 });
+    setExtraSegments([]);
+    // If user was viewing extra-track captions, fall back to source.
+    if (useStore.getState().subtitleTrack === "extra") {
+      setSubtitleTrack("source");
+    }
+  }
+
+  async function onTranscribeExtra() {
+    if (!audio.extraAudioId) return;
+    // Reset segments + flip the active track BEFORE we start so the live
+    // stream lands in front of the user immediately and the source-track
+    // tab doesn't appear to "lose" its segments mid-stream.
+    setExtraSegments([]);
+    setSubtitleTrack("extra");
+    setExtraSubsStreaming(true);
+    setProgress("transcribe", 0);
+    setError(null);
+
+    const jobId = newJobId();
+    setJobId(jobId);
+    let ws: WebSocket | null = null;
+    try {
+      ws = await openProgressWs(jobId);
+      // Fire the request — the WS is already listening for `extra_segment`
+      // events from the worker thread, so segments arrive in real time. The
+      // HTTP response is just the final summary.
+      const res = await transcribeExtra(audio.extraAudioId, {
+        language: "en",
+        jobId,
+      });
+      // Idempotent backstop: if the WS missed any tail events (network
+      // hiccup), the HTTP response carries the canonical segment list.
+      if (Array.isArray(res.segments) && res.segments.length > 0) {
+        useStore.getState().mergeExtraSegments(res.segments);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setExtraSubsStreaming(false);
+      setProgress("idle", 0);
+      setJobId(null);
+    } finally {
+      // progress.ts closes the socket on extra_transcribe_done/cancelled/error;
+      // this is just defensive cleanup if the HTTP path errored before the WS
+      // got the terminal event.
+      if (!useStore.getState().extraSubsStreaming) {
+        try { ws?.close(); } catch { /* */ }
+      }
+    }
+  }
+
+  async function onCancelExtraTranscribe() {
+    if (!audio.extraAudioId) return;
+    void cancelTranscribeExtra(audio.extraAudioId);
+    // Don't clear streaming flag here — wait for the server to push
+    // extra_transcribe_cancelled, which progress.ts handles. This way the
+    // strip stays visible until the worker actually stops.
   }
 
   if (!audio.extraAudioId) {
@@ -308,6 +422,7 @@ function ExtraTrack({
   // Extra width is proportional to extraDuration / videoDuration. The
   // waveform is drawn ONLY in that sub-region of the bar; the rest is rail.
   const extraWidthPct = Math.min(100, (audio.extraAudioDuration / Math.max(0.01, duration)) * 100);
+  const hasExtraSubs = segmentsExtra.length > 0;
   return (
     <div className="track-row" data-testid="extra-track">
       <div className="track-label">
@@ -328,6 +443,31 @@ function ExtraTrack({
             🎵 {audio.extraAudioName ?? "extra"}
           </span>
           <span className="track-extra-dur">{audio.extraAudioDuration.toFixed(1)}s</span>
+          {extraSubsStreaming ? (
+            <button
+              type="button"
+              className="extra-transcribe-button extra-transcribe-cancel"
+              data-testid="extra-transcribe-cancel"
+              tabIndex={-1}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={onCancelExtraTranscribe}
+              title="Stop transcribing this track"
+            >
+              Cancel
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="extra-transcribe-button"
+              data-testid="extra-transcribe-button"
+              tabIndex={-1}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={onTranscribeExtra}
+              title="Run whisper on this audio track and add a separate subtitle track"
+            >
+              {hasExtraSubs ? "Re-generate subs" : "Generate subs"}
+            </button>
+          )}
           <button
             type="button"
             className="track-extra-remove"

@@ -84,6 +84,24 @@ def test_duration_zero_does_not_produce_negative() -> None:
     assert pts == [0.0]
 
 
+def test_word_mode_sentence_break_adds_extra_chunk_start() -> None:
+    # 4 words, chunk_size=4 → without sentence break: 1 chunk at w0=0.0.
+    # "world." forces a break → second chunk starts at w2=2.0.
+    seg = _seg(
+        0.0, 4.0,
+        [
+            (0.0, 1.0, "Hello"),
+            (1.0, 2.0, "world."),
+            (2.0, 3.0, "Foo"),
+            (3.0, 4.0, "bar"),
+        ],
+    )
+    pts = compute_overlay_change_times(
+        [seg], Style(mode="word", words_per_chunk=4), duration=4.0
+    )
+    assert 2.0 in pts
+
+
 def test_word_mode_single_chunk_covers_all_words() -> None:
     seg = _seg(
         1.0, 5.0,

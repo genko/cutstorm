@@ -12,7 +12,7 @@ const BG_TONE = "/tmp/bg_tone.mp3";
 
 test.describe.configure({ mode: "serial" });
 
-test("persist migrate: v2 shape upgrades to v4 without crashing", async ({
+test("persist migrate: v2 shape upgrades to current version without crashing", async ({
   page,
 }) => {
   await page.goto("/");
@@ -66,13 +66,18 @@ test("persist migrate: v2 shape upgrades to v4 without crashing", async ({
     const raw = localStorage.getItem("cutstorm-state");
     return raw ? JSON.parse(raw) : null;
   });
-  expect(migrated?.version).toBe(7);
-  expect(migrated?.state?.trimRange).toEqual({ in_sec: 0, out_sec: 0 });
+  expect(migrated?.version).toBe(8);
+  // v8 trimRange has the loop flag.
+  expect(migrated?.state?.trimRange).toEqual({ in_sec: 0, out_sec: 0, loop: false });
   expect(migrated?.state?.audio).toMatchObject({
     sourceVolume: 1.0,
     extraAudioId: null,
     extraVolume: 1.0,
   });
+  // v8 also seeds the per-track segment lists and the active-track flag.
+  expect(Array.isArray(migrated?.state?.segmentsSource)).toBe(true);
+  expect(migrated?.state?.segmentsExtra).toEqual([]);
+  expect(migrated?.state?.subtitleTrack).toBe("source");
 });
 
 test("trim in=10 out=30 via UI → ffprobe exported duration ≈ 20s", async ({

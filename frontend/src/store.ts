@@ -73,8 +73,11 @@ export type CanvasConfig = {
   bg_color: string;
 };
 
-/** Keep-range selected by the trim handles under the preview. out_sec=0 => "to end". */
-export type TrimRange = { in_sec: number; out_sec: number };
+/** Keep-range selected by the trim handles under the preview. out_sec=0 => "to end".
+ * `loop` (Coub mode): when true and an extra audio track is loaded, the
+ * [in_sec..out_sec] slice is repeated to cover the extra audio's full
+ * duration in both preview and export. */
+export type TrimRange = { in_sec: number; out_sec: number; loop: boolean };
 
 /** Original + optional extra audio track mixed into export. */
 export type AudioConfig = {
@@ -85,13 +88,31 @@ export type AudioConfig = {
   extraVolume: number;         // 0.0..2.0, default 1.0
 };
 
+/** Which transcript drives the on-screen captions and the burned subtitles
+ * at export. "source" = whisper on the original video; "extra" = whisper on
+ * the uploaded extra audio (Coub mode). */
+export type SubtitleTrack = "source" | "extra";
+
 type State = {
   videoId: string | null;
   videoUrl: string | null;
   duration: number;
   videoW: number;
   videoH: number;
+  /** Active transcript — alias of segmentsSource or segmentsExtra depending
+   * on `subtitleTrack`. Kept on the top level so existing code that reads
+   * `s.segments` still finds the right data without refactor. */
   segments: Segment[];
+  /** Whisper-on-source-video transcript. Filled by the upload flow. */
+  segmentsSource: Segment[];
+  /** Whisper-on-extra-audio transcript. Filled by the explicit Generate-subs
+   * button on the extra track. */
+  segmentsExtra: Segment[];
+  /** Which transcript is active in the editor (and used for export). */
+  subtitleTrack: SubtitleTrack;
+  /** True while transcribe-extra is streaming. Mirrors `subsStreaming` for
+   * the extra-track path. */
+  extraSubsStreaming: boolean;
   style: Style;
   position: Position;
   size: Size;
@@ -146,8 +167,16 @@ type Actions = {
       audio?: { source_volume: number; extra_audio_id: string | null; extra_volume: number };
       use_subs?: boolean;
       display_mode?: DisplayMode;
+      extra_segments?: Segment[];
+      subtitle_track?: SubtitleTrack;
     } | null;
   }) => void;
+  setLoop: (v: boolean) => void;
+  setSubtitleTrack: (track: SubtitleTrack) => void;
+  setExtraSegments: (segs: Segment[]) => void;
+  setExtraSubsStreaming: (v: boolean) => void;
+  appendExtraSegment: (seg: Segment, index: number) => void;
+  mergeExtraSegments: (segs: Segment[]) => void;
   setStyle: (patch: Partial<Style>) => void;
   setPosition: (p: Position) => void;
   setSize: (s: Size) => void;
@@ -211,6 +240,10 @@ export const useStore = create<State & Actions>()(
       videoW: 0,
       videoH: 0,
       segments: [],
+      segmentsSource: [],
+      segmentsExtra: [],
+      subtitleTrack: "source" as SubtitleTrack,
+      extraSubsStreaming: false,
       style: { ...defaultStyle },
       position: { x_pct: 10, y_pct: 80 },
       size: { w_pct: 80, h_pct: 15 },
@@ -221,7 +254,7 @@ export const useStore = create<State & Actions>()(
       currentTime: 0,
       videoEl: null,
       trim: { enabled: false, threshold_sec: 0.4, padding_sec: 0.08 },
-      trimRange: { in_sec: 0, out_sec: 0 },
+      trimRange: { in_sec: 0, out_sec: 0, loop: false },
       audio: {
         sourceVolume: 1.0,
         extraAudioId: null,
@@ -252,11 +285,15 @@ export const useStore = create<State & Actions>()(
             videoW: r.width,
             videoH: r.height,
             segments: r.segments,  // may be empty initially — bg stream fills via appendSegment
+            segmentsSource: r.segments,
+            segmentsExtra: [],
+            subtitleTrack: "source" as SubtitleTrack,
+            extraSubsStreaming: false,
             busy: "idle",
             error: null,
             isAudioOnly: isAudio,
             // A new upload represents a fresh edit: reset trim range and extra audio.
-            trimRange: { in_sec: 0, out_sec: 0 },
+            trimRange: { in_sec: 0, out_sec: 0, loop: false },
             audio: {
               sourceVolume: 1.0,
               extraAudioId: null,
@@ -272,13 +309,20 @@ export const useStore = create<State & Actions>()(
       loadProject: (r) => set((s) => {
         const isAudio = !!r.is_audio_only || (r.width === 0 && r.height === 0);
         const p = r.project ?? null;
+        const extraSegs = p?.extra_segments ?? [];
+        const track: SubtitleTrack = p?.subtitle_track ?? "source";
+        const activeSegs = track === "extra" ? extraSegs : r.segments;
         return {
           videoId: r.video_id,
           videoUrl: r.url,
           duration: r.duration,
           videoW: r.width,
           videoH: r.height,
-          segments: r.segments,
+          segments: activeSegs,
+          segmentsSource: r.segments,
+          segmentsExtra: extraSegs,
+          subtitleTrack: track,
+          extraSubsStreaming: false,
           busy: "idle",
           error: null,
           isAudioOnly: isAudio,
@@ -289,7 +333,9 @@ export const useStore = create<State & Actions>()(
           position: p?.position ?? s.position,
           size: p?.size ?? s.size,
           canvas: p?.canvas ?? s.canvas,
-          trimRange: p?.trim_range ?? { in_sec: 0, out_sec: 0 },
+          trimRange: p?.trim_range
+            ? { in_sec: p.trim_range.in_sec, out_sec: p.trim_range.out_sec, loop: !!p.trim_range.loop }
+            : { in_sec: 0, out_sec: 0, loop: false },
           audio: p?.audio
             ? {
                 sourceVolume: p.audio.source_volume,
@@ -311,19 +357,62 @@ export const useStore = create<State & Actions>()(
       setStyle: (patch) => set((s) => ({ style: { ...s.style, ...patch } })),
       setPosition: (p) => set({ position: p }),
       setSize: (sz) => set({ size: sz }),
+      setLoop: (v) => set((s) => ({ trimRange: { ...s.trimRange, loop: v } })),
+      setSubtitleTrack: (track) => set((s) => ({
+        subtitleTrack: track,
+        // Mirror the active store-level alias so existing readers (overlay,
+        // segment list) update without further plumbing.
+        segments: track === "extra" ? s.segmentsExtra : s.segmentsSource,
+      })),
+      setExtraSegments: (segs) => set((s) => ({
+        segmentsExtra: segs,
+        segments: s.subtitleTrack === "extra" ? segs : s.segments,
+      })),
+      setExtraSubsStreaming: (v) => set({ extraSubsStreaming: v }),
+      appendExtraSegment: (seg, index) => set((s) => {
+        const next = [...s.segmentsExtra];
+        next[index] = seg;
+        for (let i = 0; i < next.length; i++) {
+          if (next[i] === undefined) {
+            next[i] = { start: 0, end: 0, text: "…", words: [] };
+          }
+        }
+        return s.subtitleTrack === "extra"
+          ? { segments: next, segmentsExtra: next }
+          : { segmentsExtra: next };
+      }),
+      mergeExtraSegments: (incoming) => set((s) => {
+        const next = [...s.segmentsExtra];
+        incoming.forEach((seg, i) => {
+          if (!next[i] || next[i].text !== seg.text || next[i].start !== seg.start) {
+            next[i] = seg;
+          }
+        });
+        return s.subtitleTrack === "extra"
+          ? { segments: next, segmentsExtra: next }
+          : { segmentsExtra: next };
+      }),
       updateSegment: (i, patch) =>
-        set((s) => ({
-          segments: s.segments.map((seg, idx) => {
+        set((s) => {
+          const next = s.segments.map((seg, idx) => {
             if (idx !== i) return seg;
-            const next = { ...seg, ...patch };
+            const merged: Segment = { ...seg, ...patch };
             if (patch.text !== undefined && patch.text !== seg.text) {
-              next.words = undefined;
+              merged.words = undefined;
             }
-            return next;
-          }),
-        })),
+            return merged;
+          });
+          return s.subtitleTrack === "extra"
+            ? { segments: next, segmentsExtra: next }
+            : { segments: next, segmentsSource: next };
+        }),
       deleteSegment: (i) =>
-        set((s) => ({ segments: s.segments.filter((_, idx) => idx !== i) })),
+        set((s) => {
+          const next = s.segments.filter((_, idx) => idx !== i);
+          return s.subtitleTrack === "extra"
+            ? { segments: next, segmentsExtra: next }
+            : { segments: next, segmentsSource: next };
+        }),
       setBusy: (b) => set({ busy: b }),
       setError: (msg) => set({ error: msg }),
       setProgress: (phase, percent) => set({ progressPhase: phase, progressPercent: percent }),
@@ -348,15 +437,18 @@ export const useStore = create<State & Actions>()(
       setSubsStreaming: (v) => set({ subsStreaming: v }),
       setJobId: (id) => set({ jobId: id }),
       mergeSegments: (serverSegs) => set((s) => {
-        // Merge server snapshot into current list without truncating. If the
-        // WS already delivered later segments during recovery, keep them.
-        const next = [...s.segments];
+        // Merge server snapshot into the SOURCE transcript without truncating.
+        // Source segments are filled by the upload-time whisper pass; the
+        // extra-track transcript has its own merge path via setExtraSegments.
+        const next = [...s.segmentsSource];
         serverSegs.forEach((seg, i) => {
           if (!next[i] || (next[i] && (next[i].text !== seg.text || next[i].start !== seg.start))) {
             next[i] = seg;
           }
         });
-        return { segments: next };
+        return s.subtitleTrack === "source"
+          ? { segments: next, segmentsSource: next }
+          : { segmentsSource: next };
       }),
       newProject: async () => {
         // Best-effort server-side cancellation of any in-flight whisper for
@@ -370,7 +462,7 @@ export const useStore = create<State & Actions>()(
         useStore.getState().reset();
       },
       appendSegment: (seg, index) => set((s) => {
-        const next = [...s.segments];
+        const next = [...s.segmentsSource];
         next[index] = seg;
         // If the backend emitted indices out of order somehow, fill any gaps
         // with placeholders (extremely unlikely; defensive only).
@@ -379,7 +471,9 @@ export const useStore = create<State & Actions>()(
             next[i] = { start: 0, end: 0, text: "…", words: [] };
           }
         }
-        return { segments: next };
+        return s.subtitleTrack === "source"
+          ? { segments: next, segmentsSource: next }
+          : { segmentsSource: next };
       }),
       setCustomCrop: (patch) => set((s) => {
         const next = { ...s.canvas.custom, ...patch };
@@ -422,16 +516,20 @@ export const useStore = create<State & Actions>()(
             : seg.text;
           const left = { ...seg, end: t, text: leftText, words: leftWords.length ? leftWords : undefined };
           const right = { ...seg, start: t, text: rightText, words: rightWords.length ? rightWords : undefined };
-          return {
-            segments: [...s.segments.slice(0, idx), left, right, ...s.segments.slice(idx + 1)],
-          };
+          const next = [...s.segments.slice(0, idx), left, right, ...s.segments.slice(idx + 1)];
+          return s.subtitleTrack === "extra"
+            ? { segments: next, segmentsExtra: next }
+            : { segments: next, segmentsSource: next };
         }),
       deleteCurrent: () =>
         set((s) => {
           const t = s.currentTime;
           const idx = s.segments.findIndex((seg) => t >= seg.start && t <= seg.end);
           if (idx < 0) return {};
-          return { segments: s.segments.filter((_, i) => i !== idx) };
+          const next = s.segments.filter((_, i) => i !== idx);
+          return s.subtitleTrack === "extra"
+            ? { segments: next, segmentsExtra: next }
+            : { segments: next, segmentsSource: next };
         }),
       reset: () =>
         set({
@@ -441,6 +539,10 @@ export const useStore = create<State & Actions>()(
           videoW: 0,
           videoH: 0,
           segments: [],
+          segmentsSource: [],
+          segmentsExtra: [],
+          subtitleTrack: "source" as SubtitleTrack,
+          extraSubsStreaming: false,
           busy: "idle",
           error: null,
           progressPhase: "idle",
@@ -450,7 +552,7 @@ export const useStore = create<State & Actions>()(
           subsStreaming: false,
           jobId: null,
           watermark: true,
-          trimRange: { in_sec: 0, out_sec: 0 },
+          trimRange: { in_sec: 0, out_sec: 0, loop: false },
           audio: {
             sourceVolume: 1.0,
             extraAudioId: null,
@@ -473,6 +575,9 @@ export const useStore = create<State & Actions>()(
         videoW: s.videoW,
         videoH: s.videoH,
         segments: s.segments,
+        segmentsSource: s.segmentsSource,
+        segmentsExtra: s.segmentsExtra,
+        subtitleTrack: s.subtitleTrack,
         style: s.style,
         position: s.position,
         size: s.size,
@@ -487,7 +592,7 @@ export const useStore = create<State & Actions>()(
         subsStreaming: s.subsStreaming,
         jobId: s.jobId,
       }),
-        version: 7,
+        version: 8,
         // Historical fields migrate forward:
         //   v1→v2: `canvas` gained mode/crop_anchor/custom (Feature 1).
         //   v2→v3: `trimRange` added (Feature Trim in/out).
@@ -536,6 +641,25 @@ export const useStore = create<State & Actions>()(
             // v6→v7: watermark toggle (on by default for new projects).
             p.watermark = p.watermark ?? true;
           }
+          if (version < 8) {
+            // v7→v8: Coub-mode fields.
+            //   trimRange.loop : new boolean (default false).
+            //   segmentsSource : copy of legacy `segments` (the only track
+            //                    that existed before extra-track transcribe).
+            //   segmentsExtra  : empty list — extra subs are only filled by
+            //                    explicit user action.
+            //   subtitleTrack  : "source" — preserves prior behaviour.
+            const tr = (p.trimRange as Record<string, unknown> | undefined) ?? {};
+            p.trimRange = {
+              in_sec: typeof tr.in_sec === "number" ? tr.in_sec : 0,
+              out_sec: typeof tr.out_sec === "number" ? tr.out_sec : 0,
+              loop: typeof tr.loop === "boolean" ? tr.loop : false,
+            };
+            const segs = Array.isArray(p.segments) ? p.segments : [];
+            p.segmentsSource = (p.segmentsSource as unknown) ?? segs;
+            p.segmentsExtra = (p.segmentsExtra as unknown) ?? [];
+            p.subtitleTrack = (p.subtitleTrack as unknown) ?? "source";
+          }
           return p;
         },
       },
@@ -543,6 +667,9 @@ export const useStore = create<State & Actions>()(
     {
       partialize: (s) => ({
         segments: s.segments,
+        segmentsSource: s.segmentsSource,
+        segmentsExtra: s.segmentsExtra,
+        subtitleTrack: s.subtitleTrack,
         style: s.style,
         position: s.position,
         size: s.size,

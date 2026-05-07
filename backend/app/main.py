@@ -147,7 +147,15 @@ def _sweep_orphans() -> dict:
                     entry.unlink(missing_ok=True)
                     counts["url_cache"] += 1
 
-        # uploads/extra_*.{audio-ext} — drop unreferenced
+        # uploads/extra_*.{audio-ext} — drop unreferenced.
+        # IMPORTANT: skip files newer than EXTRA_GRACE_SEC. The frontend's
+        # autosave debounces project-state PUTs by ~500ms, and a server
+        # restart inside that window would otherwise wipe the extra track
+        # the user just uploaded (race observed during loop-mode rollout).
+        # 24h is plenty of headroom and still cleans up genuinely abandoned
+        # files on the next periodic sweep.
+        EXTRA_GRACE_SEC = 24 * 3600
+        now = time.time()
         referenced = _referenced_extra_ids()
         for ext in _AUDIO_EXTS:
             for p in UPLOADS_DIR.glob(f"extra_*.{ext}"):
@@ -155,9 +163,22 @@ def _sweep_orphans() -> dict:
                 if not stem.startswith("extra_"):
                     continue
                 eid = stem[len("extra_"):]
-                if _EXTRA_ID_RE.match(eid) and eid not in referenced:
-                    p.unlink()
-                    counts["extras"] += 1
+                if not _EXTRA_ID_RE.match(eid):
+                    continue
+                if eid in referenced:
+                    continue
+                try:
+                    age = now - p.stat().st_mtime
+                except OSError:
+                    continue
+                if age < EXTRA_GRACE_SEC:
+                    log.info(
+                        "orphan_sweep.skip_recent_extra id=%s age=%.0fs",
+                        eid, age,
+                    )
+                    continue
+                p.unlink()
+                counts["extras"] += 1
     except Exception as exc:  # pragma: no cover
         log.warning("orphan_sweep failed: %s", exc)
 
@@ -288,7 +309,7 @@ def _meta_path(video_id: str) -> Path:
     return UPLOADS_DIR / f"{video_id}.json"
 
 
-_VIDEO_EXTS = ("mp4", "mov", "mkv", "webm", "avi")
+_VIDEO_EXTS = ("mp4", "mov", "mkv", "webm", "avi", "gif")
 _AUDIO_EXTS = ("mp3", "wav", "m4a", "ogg", "flac", "aac")
 _ALLOWED_EXTS = _VIDEO_EXTS + _AUDIO_EXTS
 
@@ -298,6 +319,7 @@ _MIME_BY_EXT = {
     "mkv":  "video/x-matroska",
     "webm": "video/webm",
     "avi":  "video/x-msvideo",
+    "gif":  "image/gif",
     "mp3":  "audio/mpeg",
     "wav":  "audio/wav",
     "m4a":  "audio/mp4",
@@ -571,6 +593,13 @@ def _finalize_uploaded_media(
             old_task.cancel()
 
     info = probe(final)
+    # Silent inputs (gifs, screen recordings without a mic) have nothing for
+    # whisper to chew on — force-skip transcription so we don't spawn a task
+    # that would just spin and emit zero segments.
+    if not info.has_audio:
+        if generate_subs:
+            log.info("finalize.no_audio_skip_whisper video_id=%s", video_id)
+        generate_subs = False
     immediate = TranscribeResponse(
         video_id=video_id,
         duration=info.duration,
@@ -1224,6 +1253,145 @@ def _clip_segments_to_trim(
     return out_segs
 
 
+# In-flight extra-audio transcribe runs keyed by extra_audio_id. Each entry
+# is a cancel flag dict — the worker thread polls flag["v"] between segments
+# and bails when set. Mirrors `_transcribe_tasks` semantics for source video.
+_extra_transcribe_cancels: dict[str, dict] = {}
+
+
+@app.post("/api/transcribe-extra")
+async def api_transcribe_extra(
+    extra_audio_id: str = Form(...),
+    language: str | None = Form(default="ru"),
+    model: str | None = Form(default=None),
+    job_id: str | None = Query(default=None),
+    x_job_id: str | None = Header(default=None),
+) -> dict:
+    """Run whisper on a previously uploaded extra audio track. Streams progress
+    via the same WS channel as /api/transcribe (phases prefixed with
+    `extra_*`), then returns the final segments. The result is NOT cached on
+    disk — extra-audio transcripts are stored client-side in the project
+    state (`extra_segments` field) so they survive reload alongside the
+    source transcript."""
+    jid = job_id or x_job_id
+    if not _EXTRA_ID_RE.match(extra_audio_id):
+        raise HTTPException(status_code=400, detail="invalid extra_audio_id")
+    extra_path = _find_extra_audio(extra_audio_id)
+    if extra_path is None:
+        raise HTTPException(status_code=404, detail="extra audio not found")
+
+    log.info("transcribe_extra.start id=%s job_id=%s", extra_audio_id, jid)
+
+    info = probe(extra_path)
+
+    # Replace any in-flight run for the SAME extra audio (user clicked
+    # "Generate" again before the first one finished). Different extra IDs
+    # run in parallel — same as how /api/transcribe per-video tasks work.
+    prev = _extra_transcribe_cancels.pop(extra_audio_id, None)
+    if prev is not None:
+        prev["v"] = True
+        log.info("transcribe_extra.preempt previous run id=%s", extra_audio_id)
+
+    cancel_flag: dict = {"v": False}
+    _extra_transcribe_cancels[extra_audio_id] = cancel_flag
+
+    def on_segment(seg: Segment, idx: int, pct: int) -> None:
+        ws.push(jid, {
+            "phase": "extra_segment",
+            "extra_audio_id": extra_audio_id,
+            "index": idx,
+            "segment": seg.model_dump(),
+            "percent": pct,
+        })
+
+    def on_progress(phase: str, percent: int) -> None:
+        # Re-tag phase so the frontend can route extra-track progress without
+        # being confused with source-video progress.
+        ws.push(jid, {
+            "phase": f"extra_{phase}",
+            "percent": percent,
+            "extra_audio_id": extra_audio_id,
+        })
+
+    def cancel_check() -> bool:
+        return cancel_flag["v"]
+
+    def worker() -> tuple[list[Segment], str | None]:
+        return transcribe_stream(
+            extra_path,
+            language=language,
+            model_name=model,
+            on_segment=on_segment,
+            on_progress=on_progress,
+            cancel_check=cancel_check,
+        )
+
+    try:
+        segments, detected = await asyncio.to_thread(worker)
+    except Exception as exc:
+        _extra_transcribe_cancels.pop(extra_audio_id, None)
+        log.exception("transcribe_extra.failed id=%s err=%s", extra_audio_id, exc)
+        ws.push(jid, {"phase": "extra_transcribe_error", "extra_audio_id": extra_audio_id, "error": str(exc)})
+        raise HTTPException(status_code=500, detail=f"extra transcribe failed: {exc}")
+
+    # Drop our slot before notifying — by the time the client reads the
+    # response, the cancel flag is no longer relevant.
+    if _extra_transcribe_cancels.get(extra_audio_id) is cancel_flag:
+        _extra_transcribe_cancels.pop(extra_audio_id, None)
+
+    if cancel_flag["v"]:
+        log.info(
+            "transcribe_extra.cancelled id=%s segments_so_far=%d",
+            extra_audio_id, len(segments),
+        )
+        ws.push(jid, {
+            "phase": "extra_transcribe_cancelled",
+            "extra_audio_id": extra_audio_id,
+            "total_segments": len(segments),
+        })
+        # Still return what we have so the client can keep partial captions
+        # if it wants — symmetric with the source-track behaviour.
+        return {
+            "extra_audio_id": extra_audio_id,
+            "duration": info.duration,
+            "language": detected,
+            "segments": [s.model_dump() for s in segments],
+            "cancelled": True,
+        }
+
+    ws.push(jid, {
+        "phase": "extra_transcribe_done",
+        "extra_audio_id": extra_audio_id,
+        "percent": 100,
+        "language": detected,
+        "total_segments": len(segments),
+    })
+    log.info(
+        "transcribe_extra.done id=%s segments=%d lang=%s",
+        extra_audio_id, len(segments), detected,
+    )
+    return {
+        "extra_audio_id": extra_audio_id,
+        "duration": info.duration,
+        "language": detected,
+        "segments": [s.model_dump() for s in segments],
+    }
+
+
+@app.post("/api/transcribe-extra/{extra_audio_id}/cancel")
+def cancel_transcribe_extra(extra_audio_id: str) -> dict:
+    """Signal the running transcribe-extra worker to stop after the next
+    segment boundary. Mirrors /api/transcribe/{video_id}/cancel."""
+    if not _EXTRA_ID_RE.match(extra_audio_id):
+        raise HTTPException(status_code=400, detail="invalid extra_audio_id")
+    flag = _extra_transcribe_cancels.get(extra_audio_id)
+    if flag is None:
+        return {"ok": True, "cancelled": False}
+    flag["v"] = True
+    log.info("transcribe_extra.cancel id=%s", extra_audio_id)
+    return {"ok": True, "cancelled": True}
+
+
 @app.post("/api/extra-audio", response_model=ExtraAudioResponse)
 async def api_extra_audio(
     file: UploadFile = File(...),
@@ -1324,6 +1492,36 @@ async def api_peaks_extra(
     return JSONResponse({"peaks": values})
 
 
+@app.get("/api/extra-audio/{extra_id}")
+def api_extra_audio_file(extra_id: str) -> FileResponse:
+    """Serve the raw extra-audio file. Used by the preview's WebAudio graph
+    after a page reload, when the in-memory blob URL is gone but the project
+    still references the upload by id."""
+    extra = _find_extra_audio(extra_id)
+    if extra is None:
+        raise HTTPException(status_code=404, detail="extra audio not found")
+    ext = extra.suffix.lstrip(".").lower()
+    mime = _MIME_BY_EXT.get(ext, "application/octet-stream")
+    return FileResponse(extra, media_type=mime)
+
+
+@app.get("/api/extra-audio/{extra_id}/info")
+def api_extra_audio_info(extra_id: str) -> dict:
+    """Lightweight metadata for the extra-audio file: duration and file
+    extension. Used by the editor on project-load to rehydrate the trim
+    bar's waveform width and the toolbar's track label without forcing the
+    user to re-upload."""
+    extra = _find_extra_audio(extra_id)
+    if extra is None:
+        raise HTTPException(status_code=404, detail="extra audio not found")
+    info = probe(extra)
+    return {
+        "extra_audio_id": extra_id,
+        "duration": info.duration,
+        "ext": extra.suffix.lstrip(".").lower(),
+    }
+
+
 @app.get("/api/peaks/{video_id}")
 async def api_peaks(
     video_id: str,
@@ -1382,7 +1580,10 @@ async def api_export(
     clipped_duration = trim_out - trim_in
 
     segments_for_render = req.segments
-    if edge_trim_active:
+    # Extra-track subtitles ride the master extra-audio timeline; they are
+    # NOT clipped to the source video's trim window (their timestamps refer
+    # to the extra audio, not to the original video).
+    if edge_trim_active and req.subtitle_track != "extra":
         segments_for_render = _clip_segments_to_trim(req.segments, trim_in, trim_out)
 
     keeps: list[tuple[float, float]] | None = None
@@ -1408,12 +1609,61 @@ async def api_export(
     if req.audio.extra_audio_id:
         extra_audio_path = _find_extra_audio(req.audio.extra_audio_id)
         if extra_audio_path is None:
+            # Hard-fail when the user explicitly relies on the track for
+            # loop-mode duration; soft-warn when it's just a mix that we can
+            # render without (so the export still produces something usable).
+            if req.trim.loop:
+                log.warning(
+                    "export.extra_audio_missing id=%s loop=true — refusing export",
+                    req.audio.extra_audio_id,
+                )
+                raise HTTPException(
+                    status_code=410,
+                    detail=(
+                        "Extra audio track is missing on the server "
+                        "(file was cleaned up). Re-upload it before "
+                        "exporting in loop mode."
+                    ),
+                )
             log.warning("export.extra_audio_missing id=%s — proceeding without mix", req.audio.extra_audio_id)
 
+    # ---- loop mode (Coub-style): repeat the trimmed slice across the extra
+    # audio's full duration. Only active when both sides agree.
+    loop_active = bool(req.trim.loop) and extra_audio_path is not None and not info.is_audio_only
+    loop_total_duration: float | None = None
+    if loop_active:
+        try:
+            extra_info = probe(extra_audio_path)
+            extra_dur = float(extra_info.duration)
+        except Exception as exc:
+            log.warning("export.loop_probe_failed extra=%s err=%s", extra_audio_path, exc)
+            extra_dur = 0.0
+        if extra_dur > 0:
+            loop_clip_duration = clipped_duration  # short slice
+            loop_total_duration = extra_dur
+            new_duration = extra_dur
+            # Source-track subtitles: stamp copies onto each iteration so each
+            # loop displays them. Extra-track subtitles already ride the
+            # master extra-audio timeline and need no expansion.
+            if req.subtitle_track == "source":
+                from .loop_segments import expand_loop_segments
+                segments_for_render = expand_loop_segments(
+                    segments_for_render,
+                    trim_in=trim_in,
+                    loop_clip_duration=loop_clip_duration,
+                    total_duration=loop_total_duration,
+                )
+            log.info(
+                "export.loop active clip=%.2fs total=%.2fs subtitle_track=%s",
+                loop_clip_duration, loop_total_duration, req.subtitle_track,
+            )
+        else:
+            loop_active = False  # bail out, treat as normal export
+
     log.info(
-        "export.render start target=%dx%d audio_only=%s duration=%.2fs trim_edges=(%.2f,%.2f) extra_audio=%s",
+        "export.render start target=%dx%d audio_only=%s duration=%.2fs trim_edges=(%.2f,%.2f) extra_audio=%s loop=%s",
         resolved.target_w, resolved.target_h, info.is_audio_only, new_duration,
-        trim_in, trim_out, extra_audio_path,
+        trim_in, trim_out, extra_audio_path, loop_active,
     )
 
     out = _output_path(req.video_id)
@@ -1449,6 +1699,13 @@ async def api_export(
         watermark_path = None
     wm_active = watermark_path is not None
 
+    # In loop mode we always need a filter pass — no stream_copy can repeat
+    # frames. Trim_duration_arg here means "the short clip length", not the
+    # output length.
+    loop_trim_duration_arg = (
+        clipped_duration if (loop_active and clipped_duration > 0) else trim_duration_arg
+    )
+
     def do_render() -> None:
         if not has_overlay and not info.is_audio_only:
             if (
@@ -1457,6 +1714,7 @@ async def api_export(
                 and not edge_trim_active
                 and not audio_mix_active
                 and not wm_active
+                and not loop_active
             ):
                 log.info("export.path stream_copy")
                 try:
@@ -1467,8 +1725,8 @@ async def api_export(
                 except RuntimeError as exc:
                     log.warning("export.stream_copy fallback filter_only err=%s", exc)
             log.info(
-                "export.path filter_only trim_silence=%s edge_trim=%s canvas=%s audio_mix=%s",
-                trim_active, edge_trim_active, canvas_transform, audio_mix_active,
+                "export.path filter_only trim_silence=%s edge_trim=%s canvas=%s audio_mix=%s loop=%s",
+                trim_active, edge_trim_active, canvas_transform, audio_mix_active, loop_active,
             )
             simple_export.run_filter_only(
                 source=media, out=out,
@@ -1478,17 +1736,18 @@ async def api_export(
                 select_expr=select_expr,
                 on_progress=on_progress,
                 trim_in=trim_in,
-                trim_duration=trim_duration_arg,
+                trim_duration=loop_trim_duration_arg,
                 source_volume=req.audio.source_volume,
                 extra_audio=extra_audio_path,
                 extra_volume=req.audio.extra_volume,
                 watermark_path=watermark_path,
                 source_has_audio=info.has_audio,
+                loop_total_duration=loop_total_duration,
             )
             return
         log.info(
-            "export.path renderer has_overlay=%s audio_only=%s",
-            has_overlay, info.is_audio_only,
+            "export.path renderer has_overlay=%s audio_only=%s loop=%s",
+            has_overlay, info.is_audio_only, loop_active,
         )
         renderer.render_export(
             source=media,
@@ -1506,12 +1765,13 @@ async def api_export(
             select_expr=select_expr,
             on_progress=on_progress,
             trim_in=trim_in,
-            trim_duration=trim_duration_arg,
+            trim_duration=loop_trim_duration_arg,
             source_volume=req.audio.source_volume,
             extra_audio=extra_audio_path,
             extra_volume=req.audio.extra_volume,
             watermark=wm_active,
             source_has_audio=info.has_audio,
+            loop_total_duration=loop_total_duration,
         )
 
     try:

@@ -23,6 +23,7 @@ export function TopBar({ onOpenSidebar }: TopBarProps) {
   const videoW = useStore((s) => s.videoW);
   const videoH = useStore((s) => s.videoH);
   const segments = useStore((s) => s.segments);
+  const subtitleTrack = useStore((s) => s.subtitleTrack);
   const style = useStore((s) => s.style);
   const position = useStore((s) => s.position);
   const size = useStore((s) => s.size);
@@ -66,6 +67,7 @@ export function TopBar({ onOpenSidebar }: TopBarProps) {
         format,
         gifQuality,
         watermark,
+        subtitleTrack,
       });
       const url = downloadUrl(videoId, format);
       const a = document.createElement("a");

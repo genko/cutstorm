@@ -195,6 +195,39 @@ def test_ass_karaoke_chunks_by_words_per_chunk() -> None:
     assert "0:00:01.60,0:00:02.10" in text
 
 
+def test_ass_word_mode_breaks_chunk_on_sentence_end() -> None:
+    # 4 words fit in chunk_size=4, but "world." forces a break.
+    words = [
+        Word(start=0.0, end=0.5, text="Hello"),
+        Word(start=0.5, end=1.0, text="world."),
+        Word(start=1.0, end=1.5, text="Foo"),
+        Word(start=1.5, end=2.0, text="bar"),
+    ]
+    segs = [_seg(0.0, 2.0, "Hello world. Foo bar", words)]
+    text = ass_builder.build(
+        segs, Style(mode="word", words_per_chunk=4), Position(), Size(), 640, 480
+    )
+    # Without sentence break: 1 dialogue. With it: 2.
+    assert text.count("\nDialogue: ") == 2
+    assert "Hello world." in text
+    assert "Foo bar" in text
+
+
+def test_ass_karaoke_breaks_chunk_on_sentence_end() -> None:
+    words = [
+        Word(start=0.0, end=0.5, text="Hello"),
+        Word(start=0.5, end=1.0, text="world."),
+        Word(start=1.0, end=1.5, text="Foo"),
+        Word(start=1.5, end=2.0, text="bar"),
+    ]
+    segs = [_seg(0.0, 2.0, "Hello world. Foo bar", words)]
+    text = ass_builder.build(
+        segs, Style(mode="karaoke", words_per_chunk=4), Position(), Size(), 640, 480
+    )
+    # 4 words would fit in one karaoke chunk; sentence break splits to 2.
+    assert text.count("\nDialogue: ") == 2
+
+
 def test_ass_fade_emitted_when_set() -> None:
     segs = [_seg(0.0, 1.0, "x")]
     s = Style(fade_in_ms=200, fade_out_ms=300)

@@ -107,14 +107,17 @@ export function App() {
   }, []);
 
   // Stuck-transcribe watchdog: if the background task stops sending progress
-  // for 5 minutes, surface a toast so the user can click New project and
-  // restart instead of staring at a frozen spinner.
+  // for 5 minutes, surface a toast so the user can cancel and start over
+  // instead of staring at a frozen spinner. Triggers for either source-track
+  // or extra-track transcription, since both stream through the same WS and
+  // bump `progressHeartbeat`.
   useEffect(() => {
     const STUCK_AFTER_MS = 5 * 60 * 1000;
     let alreadyWarned = false;
     const id = setInterval(() => {
       const s = useStore.getState();
-      if (!s.subsStreaming) {
+      const streaming = s.subsStreaming || s.extraSubsStreaming;
+      if (!streaming) {
         alreadyWarned = false;
         return;
       }
@@ -124,7 +127,7 @@ export function App() {
       if (Date.now() - last > STUCK_AFTER_MS) {
         alreadyWarned = true;
         s.setError(
-          "Transcription seems stuck — no progress for 5 minutes. Click \"New project\" to start over.",
+          "Transcription seems stuck — no progress for 5 minutes. Cancel and try again.",
         );
       }
     }, 30_000);

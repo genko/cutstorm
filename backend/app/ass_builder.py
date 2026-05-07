@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Iterable
 
 from .models import Position, Segment, Size, Style, Word
+from .sentence_chunks import chunks_by_sentence
 
 
 def _hex_to_bgr(color: str) -> str:
@@ -143,8 +144,7 @@ def build(
             words = _words_or_synth(seg)
             if not words:
                 continue
-            for i in range(0, len(words), chunk_size):
-                chunk = words[i : i + chunk_size]
+            for chunk in chunks_by_sentence(words, chunk_size):
                 c_start = _fmt_time(chunk[0].start)
                 c_end = _fmt_time(chunk[-1].end)
                 chunk_text = _escape_text(" ".join(w.text.strip() for w in chunk))
@@ -164,8 +164,7 @@ def build(
             words = _words_or_synth(seg)
             if not words:
                 continue
-            for ci in range(0, len(words), chunk_size):
-                chunk = words[ci : ci + chunk_size]
+            for chunk in chunks_by_sentence(words, chunk_size):
                 chunk_start = chunk[0].start
                 chunk_end = chunk[-1].end
                 line_start = _fmt_time(chunk_start)

@@ -19,6 +19,8 @@ export type ProjectStatePayload = {
   use_subs?: boolean;
   display_mode?: DisplayMode;
   updated_at?: number;
+  extra_segments?: Segment[];
+  subtitle_track?: "source" | "extra";
 };
 
 const API_BASE = "";
@@ -162,11 +164,12 @@ export async function exportVideo(args: {
   format?: ExportFormat;
   gifQuality?: GifQuality;
   watermark?: boolean;
+  subtitleTrack?: "source" | "extra";
 }): Promise<ExportResponse> {
   const url = args.jobId
     ? `${API_BASE}/api/export?job_id=${encodeURIComponent(args.jobId)}`
     : `${API_BASE}/api/export`;
-  const trim = args.trim ?? { in_sec: 0, out_sec: 0 };
+  const trim = args.trim ?? { in_sec: 0, out_sec: 0, loop: false };
   const audio = args.audio;
   const res = await fetch(url, {
     method: "POST",
@@ -181,7 +184,11 @@ export async function exportVideo(args: {
       silence_threshold_sec: args.silenceThresholdSec ?? 0.4,
       silence_padding_sec: args.silencePaddingSec ?? 0.08,
       canvas: args.canvas ?? { preset: "source", bg_color: "#000000" },
-      trim: { in_sec: trim.in_sec, out_sec: trim.out_sec },
+      trim: {
+        in_sec: trim.in_sec,
+        out_sec: trim.out_sec,
+        loop: !!(trim as TrimRange).loop,
+      },
       audio: {
         source_volume: audio?.sourceVolume ?? 1.0,
         extra_audio_id: audio?.extraAudioId ?? null,
@@ -190,6 +197,7 @@ export async function exportVideo(args: {
       format: args.format ?? "mp4",
       gif_quality: args.gifQuality ?? "medium",
       watermark: args.watermark !== false,
+      subtitle_track: args.subtitleTrack ?? "source",
     }),
   });
   if (!res.ok) throw new Error(`export failed: ${res.status} ${await res.text()}`);
@@ -208,6 +216,31 @@ export async function uploadExtraAudio(file: File): Promise<ExtraAudioResult> {
   const res = await fetch(`${API_BASE}/api/extra-audio`, { method: "POST", body: fd });
   if (!res.ok) {
     throw new Error(`extra-audio upload failed: ${res.status} ${await res.text()}`);
+  }
+  return res.json();
+}
+
+export type TranscribeExtraResult = {
+  extra_audio_id: string;
+  duration: number;
+  language: string | null;
+  segments: Segment[];
+};
+
+export async function transcribeExtra(
+  extraAudioId: string,
+  opts: { language?: string; model?: string; jobId?: string } = {},
+): Promise<TranscribeExtraResult> {
+  const fd = new FormData();
+  fd.append("extra_audio_id", extraAudioId);
+  if (opts.language) fd.append("language", opts.language);
+  if (opts.model) fd.append("model", opts.model);
+  const url = opts.jobId
+    ? `${API_BASE}/api/transcribe-extra?job_id=${encodeURIComponent(opts.jobId)}`
+    : `${API_BASE}/api/transcribe-extra`;
+  const res = await fetch(url, { method: "POST", body: fd });
+  if (!res.ok) {
+    throw new Error(`transcribe-extra failed: ${res.status} ${await res.text()}`);
   }
   return res.json();
 }
@@ -327,6 +360,20 @@ export async function cancelTranscribe(videoId: string): Promise<boolean> {
     return !!body.cancelled;
   } catch {
     // Timeout or network — fall back to client-only reset.
+    return false;
+  }
+}
+
+export async function cancelTranscribeExtra(extraAudioId: string): Promise<boolean> {
+  try {
+    const res = await fetch(
+      `${API_BASE}/api/transcribe-extra/${encodeURIComponent(extraAudioId)}/cancel`,
+      { method: "POST", signal: AbortSignal.timeout(2000) },
+    );
+    if (!res.ok) return false;
+    const body = await res.json();
+    return !!body.cancelled;
+  } catch {
     return false;
   }
 }

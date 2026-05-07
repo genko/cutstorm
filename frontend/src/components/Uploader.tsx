@@ -163,8 +163,8 @@ export function Uploader() {
     if (busy !== "idle") return;
     const file = e.dataTransfer.files?.[0];
     if (!file) return;
-    const typeOk = file.type.startsWith("video/") || file.type.startsWith("audio/");
-    const extOk = /\.(mp4|mov|mkv|webm|avi|mp3|wav|m4a|ogg|flac|aac)$/i.test(file.name);
+    const typeOk = file.type.startsWith("video/") || file.type.startsWith("audio/") || file.type === "image/gif";
+    const extOk = /\.(mp4|mov|mkv|webm|avi|gif|mp3|wav|m4a|ogg|flac|aac)$/i.test(file.name);
     if (!typeOk && !extOk) {
       setError("Please drop a video or audio file.");
       return;
@@ -251,11 +251,11 @@ export function Uploader() {
           <div className="dropzone-sub">
             WhisperX runs locally — nothing leaves your machine.
           </div>
-          <div className="dropzone-formats">MP4 · MOV · MKV · WebM · MP3 · WAV · M4A</div>
+          <div className="dropzone-formats">MP4 · MOV · MKV · WebM · GIF · MP3 · WAV · M4A</div>
           <input
             ref={inputRef}
             type="file"
-            accept="video/*,audio/*"
+            accept="video/*,audio/*,image/gif"
             onChange={handleInputChange}
             disabled={disabled}
             className="start-hidden-input"

@@ -26,6 +26,8 @@ function projectSnapshot(s: ReturnType<typeof useStore.getState>) {
     },
     use_subs: s.useSubs,
     display_mode: s.style.mode,
+    extra_segments: s.segmentsExtra,
+    subtitle_track: s.subtitleTrack,
   };
 }
 
@@ -34,14 +36,17 @@ export function setupAutosave() {
     const id = state.videoId;
     if (!id) return;
 
-    // --- segments ---
-    if (state.segments !== prev.segments) {
-      const ser = JSON.stringify(state.segments);
+    // --- source segments ---
+    // The on-disk transcript is the SOURCE-track whisper output. Edits made
+    // while viewing the extra track land in `segmentsExtra` (project state),
+    // not the transcript file, so autosave must follow `segmentsSource`.
+    if (state.segmentsSource !== prev.segmentsSource) {
+      const ser = JSON.stringify(state.segmentsSource);
       if (ser !== lastSegSerialized) {
         if (segTimer) clearTimeout(segTimer);
         segTimer = setTimeout(async () => {
           try {
-            await updateTranscript(id, state.segments);
+            await updateTranscript(id, state.segmentsSource);
             lastSegSerialized = ser;
           } catch (err) {
             console.warn("autosave.segments failed:", err);
@@ -59,6 +64,8 @@ export function setupAutosave() {
       state.trimRange !== prev.trimRange ||
       state.audio !== prev.audio ||
       state.useSubs !== prev.useSubs ||
+      state.segmentsExtra !== prev.segmentsExtra ||
+      state.subtitleTrack !== prev.subtitleTrack ||
       state.videoId !== prev.videoId;
     if (!projectChanged) return;
 

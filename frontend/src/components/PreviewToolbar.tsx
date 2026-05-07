@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { resumeAudioContext } from "../audioMix";
+import { getAudioMix, resumeAudioContext } from "../audioMix";
 import { useStore } from "../store";
 
 /**
@@ -17,12 +17,22 @@ export function PreviewToolbar() {
   const duration = useStore((s) => s.duration);
   const currentTime = useStore((s) => s.currentTime);
   const trimRange = useStore((s) => s.trimRange);
+  const extraAudioId = useStore((s) => s.audio.extraAudioId);
+  const extraAudioDuration = useStore((s) => s.audio.extraAudioDuration);
   const [playing, setPlaying] = useState(false);
 
   const trimIn = Math.max(0, trimRange.in_sec);
   const trimOut = trimRange.out_sec > 0 ? Math.min(trimRange.out_sec, duration || 0) : (duration || 0);
-  const effectiveDuration = Math.max(0.01, trimOut - trimIn);
-  const progressVal = Math.max(0, Math.min(effectiveDuration, currentTime - trimIn));
+  const loopClipDuration = Math.max(0, trimOut - trimIn);
+  const loopActive = !!trimRange.loop && extraAudioId !== null && extraAudioDuration > 0 && loopClipDuration > 0;
+  // In loop mode the master timeline is the extra audio (0 .. extraDur);
+  // currentTime already mirrors extra.currentTime via the rAF loop.
+  const effectiveDuration = loopActive
+    ? Math.max(0.01, extraAudioDuration)
+    : Math.max(0.01, trimOut - trimIn);
+  const progressVal = loopActive
+    ? Math.max(0, Math.min(effectiveDuration, currentTime))
+    : Math.max(0, Math.min(effectiveDuration, currentTime - trimIn));
 
   useEffect(() => {
     const v = videoEl;
@@ -53,6 +63,12 @@ export function PreviewToolbar() {
     const v = videoEl;
     if (!v) return;
     v.pause();
+    if (loopActive) {
+      const extra = getAudioMix()?.extraEl;
+      if (extra) try { extra.currentTime = 0; } catch { /* */ }
+      v.currentTime = trimIn;
+      return;
+    }
     v.currentTime = trimIn;
   }
 
@@ -60,6 +76,17 @@ export function PreviewToolbar() {
     const v = videoEl;
     if (!v) return;
     const rel = Number(e.target.value);
+    if (loopActive) {
+      const extra = getAudioMix()?.extraEl;
+      if (extra) {
+        const m = Math.max(0, Math.min(extraAudioDuration, rel));
+        try { extra.currentTime = m; } catch { /* */ }
+        // Re-seat video into phase immediately for visual responsiveness.
+        const phase = loopClipDuration > 0 ? (m % loopClipDuration) : 0;
+        try { v.currentTime = trimIn + phase; } catch { /* */ }
+      }
+      return;
+    }
     v.currentTime = Math.max(trimIn, Math.min(trimOut, trimIn + rel));
   }
 
@@ -109,7 +136,9 @@ export function PreviewToolbar() {
         aria-label="Seek"
       />
       <span className="player-time" data-testid="player-time">
-        {fmt(currentTime)} <span className="player-time-sep">/</span> {fmt(duration)}
+        {fmt(loopActive ? currentTime : currentTime)}{" "}
+        <span className="player-time-sep">/</span>{" "}
+        {fmt(loopActive ? extraAudioDuration : duration)}
       </span>
     </div>
   );

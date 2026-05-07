@@ -10,11 +10,16 @@ function fmtTimestamp(t: number): string {
 
 export function SegmentList() {
   const segments = useStore((s) => s.segments);
+  const segmentsSource = useStore((s) => s.segmentsSource);
+  const segmentsExtra = useStore((s) => s.segmentsExtra);
+  const subtitleTrack = useStore((s) => s.subtitleTrack);
+  const setSubtitleTrack = useStore((s) => s.setSubtitleTrack);
   const updateSegment = useStore((s) => s.updateSegment);
   const deleteSegment = useStore((s) => s.deleteSegment);
   const currentTime = useStore((s) => s.currentTime);
   const hasVideo = useStore((s) => !!s.videoUrl);
   const subsStreaming = useStore((s) => s.subsStreaming);
+  const extraSubsStreaming = useStore((s) => s.extraSubsStreaming);
   const progressPhase = useStore((s) => s.progressPhase);
   const progressPercent = useStore((s) => s.progressPercent);
   if (!hasVideo) return null;
@@ -23,13 +28,43 @@ export function SegmentList() {
     (seg) => currentTime >= seg.start && currentTime <= seg.end,
   );
 
-  const transcribing = subsStreaming && progressPhase === "transcribe";
+  // The strip + spinner indicators show whichever track is currently being
+  // transcribed AND is the active tab in the editor.
+  const sourceTranscribing = subsStreaming && progressPhase === "transcribe";
+  const extraTranscribing = extraSubsStreaming;
+  const transcribing =
+    subtitleTrack === "extra" ? extraTranscribing : sourceTranscribing;
+  const extraAvailable = segmentsExtra.length > 0 || extraSubsStreaming;
 
   return (
     <div className="pane scroll" data-testid="segments-panel">
       <div className="pane-header">
         <h2>Transcript</h2>
         <span className="topbar-meta">{segments.length}</span>
+      </div>
+      <div className="subtitle-track-tabs" data-testid="subtitle-track-tabs">
+        <button
+          type="button"
+          className={`subtitle-track-tab${subtitleTrack === "source" ? " active" : ""}`}
+          data-testid="subtitle-track-source"
+          aria-pressed={subtitleTrack === "source"}
+          onClick={() => setSubtitleTrack("source")}
+        >
+          Source <span className="subtitle-track-count">{segmentsSource.length}</span>
+          {sourceTranscribing && <span className="subtitle-track-dot" aria-label="transcribing" />}
+        </button>
+        <button
+          type="button"
+          className={`subtitle-track-tab${subtitleTrack === "extra" ? " active" : ""}`}
+          data-testid="subtitle-track-extra"
+          aria-pressed={subtitleTrack === "extra"}
+          disabled={!extraAvailable}
+          onClick={() => setSubtitleTrack("extra")}
+          title={extraAvailable ? "Switch to extra-audio captions" : "Generate captions from extra audio first"}
+        >
+          Extra <span className="subtitle-track-count">{segmentsExtra.length}</span>
+          {extraTranscribing && <span className="subtitle-track-dot" aria-label="transcribing" />}
+        </button>
       </div>
       <div className="pane-body compact">
         {transcribing && segments.length > 0 && (
