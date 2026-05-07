@@ -27,6 +27,32 @@ def test_valid_video_id_shape_passes_validator() -> None:
     assert r.status_code == 404
 
 
+def test_gif_upload_accepted(tmp_path) -> None:
+    """A real .gif must be accepted by /api/transcribe and probed without
+    spawning whisper (silent input → generate_subs auto-disabled)."""
+    import subprocess
+    gif_path = tmp_path / "tiny.gif"
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error",
+         "-f", "lavfi", "-i", "testsrc=duration=2:size=80x60:rate=10",
+         str(gif_path)],
+        check=True,
+    )
+    payload = gif_path.read_bytes()
+    r = client.post(
+        "/api/transcribe",
+        files={"file": ("tiny.gif", payload, "image/gif")},
+        data={"language": "en", "generate_subs": "true"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["video_id"]
+    assert body["duration"] > 1.5
+    assert body["segments"] == []
+    # Silent input → status flips to "done" immediately, no pending whisper.
+    assert body["status"] == "done"
+
+
 def test_upload_oversize_rejected(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("MAX_UPLOAD_BYTES", "512")
     big = io.BytesIO(b"x" * 2048)

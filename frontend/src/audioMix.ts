@@ -151,3 +151,37 @@ export function syncExtraToVideo(video: HTMLMediaElement, trimIn: number = 0): v
     if (extra.paused) extra.play().catch(() => {});
   }
 }
+
+/**
+ * Inverse of {@link syncExtraToVideo}: in loop mode the extra audio drives
+ * the master clock and the video is repositioned every animation frame.
+ *
+ * `master` = `extraEl.currentTime`; phase = `master % loopClipDuration`;
+ * video target = `trimIn + phase`. Returns the master clock so the caller
+ * can publish it as `currentTime` for the rest of the editor.
+ */
+export function syncVideoToLoopedExtra(
+  video: HTMLMediaElement,
+  trimIn: number,
+  loopClipDuration: number,
+): { master: number; videoTarget: number } | null {
+  const c = current;
+  if (!c || !c.extraEl) return null;
+  const extra = c.extraEl;
+  const master = extra.currentTime;
+  if (!Number.isFinite(master)) return null;
+  const phase = loopClipDuration > 0 ? (master % loopClipDuration) : 0;
+  const target = trimIn + phase;
+  if (Number.isFinite(target) && Math.abs(video.currentTime - target) > 0.05) {
+    try { video.currentTime = target; } catch { /* */ }
+  }
+  // Mirror play/pause from the video element to the extra (the user's
+  // play button still targets the video element). When extra is the master,
+  // pausing video must also pause extra.
+  if (video.paused) {
+    if (!extra.paused) extra.pause();
+  } else {
+    if (extra.paused) extra.play().catch(() => {});
+  }
+  return { master, videoTarget: target };
+}

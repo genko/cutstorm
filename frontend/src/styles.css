@@ -1960,6 +1960,116 @@ label {
   color: var(--danger);
 }
 
+.extra-transcribe-button {
+  padding: 2px 10px;
+  background: rgba(124, 92, 255, 0.15);
+  color: #b8a6ff;
+  border: 1px solid rgba(124, 92, 255, 0.4);
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+  margin-left: 6px;
+}
+
+.extra-transcribe-button:hover:not(:disabled) {
+  background: rgba(124, 92, 255, 0.3);
+  color: #fff;
+}
+
+.extra-transcribe-button:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.extra-transcribe-cancel {
+  background: rgba(255, 80, 80, 0.18);
+  color: #ffb4b4;
+  border-color: rgba(255, 80, 80, 0.5);
+}
+
+.extra-transcribe-cancel:hover {
+  background: rgba(255, 80, 80, 0.32);
+  color: #fff;
+}
+
+.subtitle-track-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-left: 6px;
+  border-radius: 50%;
+  background: #7c5cff;
+  animation: subtitle-track-pulse 1.1s ease-in-out infinite;
+  vertical-align: middle;
+}
+
+@keyframes subtitle-track-pulse {
+  0%, 100% { opacity: 0.45; transform: scale(0.85); }
+  50% { opacity: 1; transform: scale(1.1); }
+}
+
+.loop-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 12px;
+}
+
+.loop-toggle input[type="checkbox"] {
+  margin: 0;
+}
+
+.loop-toggle .loop-target {
+  color: #ffd400;
+  font-variant-numeric: tabular-nums;
+}
+
+.loop-toggle .loop-hint {
+  color: var(--fg-dim);
+  font-style: italic;
+}
+
+.subtitle-track-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 4px 12px 6px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.subtitle-track-tab {
+  padding: 4px 10px;
+  background: transparent;
+  color: var(--fg-dim);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.subtitle-track-tab.active {
+  background: rgba(124, 92, 255, 0.18);
+  color: #fff;
+  border-color: rgba(124, 92, 255, 0.45);
+}
+
+.subtitle-track-tab:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.subtitle-track-count {
+  margin-left: 4px;
+  color: var(--fg-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.subtitle-track-tab.active .subtitle-track-count {
+  color: rgba(255, 255, 255, 0.7);
+}
+
 /* Compact horizontal volume control used inside the track label. */
 .vol-wrap {
   display: flex;

@@ -56,6 +56,8 @@ def run_filter_only(
     extra_volume: float = 1.0,
     watermark_path: Path | None = None,
     source_has_audio: bool = True,
+    loop_total_duration: float | None = None,
+    fps: int = 30,
 ) -> None:
     """Case B: canvas transform and/or trim, but no subtitle overlay.
 
@@ -64,10 +66,39 @@ def run_filter_only(
 
     `trim_in` / `trim_duration` apply as input-seek on the source input.
     `source_volume` / `extra_audio` / `extra_volume` apply an audio mix.
+    `loop_total_duration` (Coub-mode) extends the trimmed slice to that total
+    by repeating both the video and the source-audio buffers via the `loop`
+    /`aloop` filters; extra audio rides the master timeline as-is.
     """
     out.parent.mkdir(parents=True, exist_ok=True)
     pre = f"select='{select_expr}',setpts=N/FRAME_RATE/TB," if select_expr else ""
     chain_main = canvas_filter if canvas_filter else f"scale={target_w}:{target_h}"
+
+    loop_active = (
+        loop_total_duration is not None
+        and loop_total_duration > 0
+        and trim_duration is not None
+        and trim_duration > 0
+    )
+    loop_video_suffix = ""
+    loop_audio_suffix = ""
+    if loop_active:
+        # loop filter buffers `size` frames of the (already trimmed) input,
+        # then emits them on repeat. We pin size to exactly the clip length
+        # so the buffer doesn't grow unboundedly in RAM.
+        frames_in_clip = max(1, int(round(trim_duration * fps)) + 2)
+        loop_video_suffix = (
+            f",loop=loop=-1:size={frames_in_clip}:start=0"
+            f",trim=duration={loop_total_duration:.3f}"
+            f",setpts=N/FRAME_RATE/TB"
+        )
+        # Audio loop: assume 48 kHz, +1024 sample headroom for fenceposts.
+        samples_in_clip = max(1, int(round(trim_duration * 48000)) + 1024)
+        loop_audio_suffix = (
+            f",aloop=loop=-1:size={samples_in_clip}:start=0"
+            f",atrim=duration={loop_total_duration:.3f}"
+            f",asetpts=N/SR/TB"
+        )
 
     # Video chain: process source → canvas → optionally composite watermark.
     # Watermark is 16% of the canvas width, placed bottom-right with 2%/3%
@@ -79,7 +110,7 @@ def run_filter_only(
         margin_x = max(1, int(target_w * 0.02))
         margin_y = max(1, int(target_h * 0.03))
         filter_complex = (
-            f"[0:v]{pre}{chain_main}[vbase];"
+            f"[0:v]{pre}{chain_main}{loop_video_suffix}[vbase];"
             f"[{wm_input_idx}:v]scale={wm_w}:-1[wm];"
             # shortest=1 + repeatlast=0: overlay stops emitting frames the
             # moment the base video ends. Without this the looped PNG keeps
@@ -88,7 +119,7 @@ def run_filter_only(
             f"[vbase][wm]overlay=W-w-{margin_x}:H-h-{margin_y}:shortest=1:repeatlast=0[v]"
         )
     else:
-        filter_complex = f"[0:v]{pre}{chain_main}[v]"
+        filter_complex = f"[0:v]{pre}{chain_main}{loop_video_suffix}[v]"
 
     has_extra = extra_audio is not None
     # When source has no audio stream (e.g. screen recording, mute camera),
@@ -103,9 +134,19 @@ def run_filter_only(
 
     if select_expr and source_has_audio:
         # silence-trim takes precedence for timing; volume/mix still apply after.
-        src_audio = f"[0:a]aselect='{select_expr}',asetpts=N/SR/TB,volume={source_volume:.3f}"
+        src_audio_chain = (
+            f"aselect='{select_expr}',asetpts=N/SR/TB"
+            f"{loop_audio_suffix},volume={source_volume:.3f}"
+        )
+    elif loop_active:
+        # Strip the leading comma since this is the start of the chain.
+        src_audio_chain = (
+            f"{loop_audio_suffix.lstrip(',')}"
+            f",volume={source_volume:.3f}"
+        )
     else:
-        src_audio = f"[0:a]volume={source_volume:.3f}"
+        src_audio_chain = f"volume={source_volume:.3f}"
+    src_audio = f"[0:a]{src_audio_chain}"
 
     if has_extra and source_has_audio:
         # Mix source + extra.
@@ -133,7 +174,10 @@ def run_filter_only(
         cmd += ["-t", f"{trim_duration:.3f}"]
     cmd += ["-i", str(source)]
     if has_extra:
-        if trim_duration is not None and trim_duration > 0.0:
+        # In loop mode the extra audio drives the master timeline — do NOT
+        # cap it at trim_duration. Without loop, mirror the source trim so
+        # both inputs match the video clip length.
+        if not loop_active and trim_duration is not None and trim_duration > 0.0:
             cmd += ["-t", f"{trim_duration:.3f}"]
         cmd += ["-i", str(extra_audio)]
     if has_watermark:
@@ -148,8 +192,10 @@ def run_filter_only(
         "-crf", "16",
     ]
     # -shortest stops encoding when the shortest input ends; otherwise the
-    # looped watermark PNG would extend the video forever.
-    if has_watermark:
+    # looped watermark PNG (or aloop'd source) would extend the video
+    # forever. In loop mode atrim/trim filters already cap the duration,
+    # but -shortest is still cheap insurance.
+    if has_watermark or loop_active:
         cmd += ["-shortest"]
     cmd += [str(out)]
     log.info("simple_export.filter_only cmd=%s", " ".join(cmd))

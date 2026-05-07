@@ -162,19 +162,47 @@ def _ffmpeg_cmd_video(
     extra_audio: Path | None = None,
     extra_volume: float = 1.0,
     source_has_audio: bool = True,
+    loop_total_duration: float | None = None,
 ) -> list[str]:
-    """Build ffmpeg for: source video → scale/crop + overlay PNG stream + audio."""
-    # Source video gets canvas_filter (crop/scale/pad) then overlay.
-    # If select_expr (trim silences) — applied before canvas_filter.
-    # canvas_filter already scales to target dims when needed; only add an
-    # explicit scale if it's empty (no canvas transform at all).
+    """Build ffmpeg for: source video → scale/crop + overlay PNG stream + audio.
+
+    `loop_total_duration` (Coub mode): when set together with `trim_duration`,
+    the trimmed source slice is repeated to cover this total duration via the
+    `loop` / `aloop` filters. Caller is responsible for sizing the overlay
+    PNG stream to match `loop_total_duration` (i.e. PNG-frames captured at
+    `total_duration * fps`).
+    """
     pre = ""
     if select_expr:
         pre = f"select='{select_expr}',setpts=N/FRAME_RATE/TB,"
-    if canvas_filter:
-        chain = f"[0:v]{pre}{canvas_filter}[bg]"
+
+    loop_active = (
+        loop_total_duration is not None
+        and loop_total_duration > 0
+        and trim_duration is not None
+        and trim_duration > 0
+    )
+    if loop_active:
+        frames_in_clip = max(1, int(round(trim_duration * fps)) + 2)
+        loop_video_suffix = (
+            f",loop=loop=-1:size={frames_in_clip}:start=0"
+            f",trim=duration={loop_total_duration:.3f}"
+            f",setpts=N/FRAME_RATE/TB"
+        )
+        samples_in_clip = max(1, int(round(trim_duration * 48000)) + 1024)
+        loop_audio_suffix = (
+            f",aloop=loop=-1:size={samples_in_clip}:start=0"
+            f",atrim=duration={loop_total_duration:.3f}"
+            f",asetpts=N/SR/TB"
+        )
     else:
-        chain = f"[0:v]{pre}scale={target_w}:{target_h}[bg]"
+        loop_video_suffix = ""
+        loop_audio_suffix = ""
+
+    if canvas_filter:
+        chain = f"[0:v]{pre}{canvas_filter}{loop_video_suffix}[bg]"
+    else:
+        chain = f"[0:v]{pre}scale={target_w}:{target_h}{loop_video_suffix}[bg]"
 
     has_extra = extra_audio is not None
     # Branches that touch [0:a] must be gated on source_has_audio — otherwise
@@ -184,24 +212,40 @@ def _ffmpeg_cmd_video(
         has_extra
         or (source_has_audio and abs(source_volume - 1.0) > 1e-3)
         or (source_has_audio and select_expr is not None)
+        or (source_has_audio and loop_active)
     )
 
     if select_expr and source_has_audio:
-        src_audio = f"[0:a]aselect='{select_expr}',asetpts=N/SR/TB,volume={source_volume:.3f}"
+        src_audio = (
+            f"[0:a]aselect='{select_expr}',asetpts=N/SR/TB"
+            f"{loop_audio_suffix},volume={source_volume:.3f}"
+        )
+    elif loop_active and source_has_audio:
+        src_audio = (
+            f"[0:a]{loop_audio_suffix.lstrip(',')}"
+            f",volume={source_volume:.3f}"
+        )
     else:
         src_audio = f"[0:a]volume={source_volume:.3f}"
 
     if has_extra and source_has_audio:
         # overlay input is index 1 (image2pipe); extra audio is index 2.
+        # apad pads the SHORTER input with silence so amix doesn't end the
+        # output stream early when extra audio < video clip and -shortest
+        # is in effect later. Without this the encoder closes its stdin
+        # mid-render and the PNG-pipe driver hits BrokenPipeError.
         audio_chain = (
-            f";{src_audio}[a0];[2:a]volume={extra_volume:.3f}[a1];"
-            f"[a0][a1]amix=inputs=2:duration=first:normalize=0[a]"
+            f";{src_audio},apad[a0];[2:a]volume={extra_volume:.3f},apad[a1];"
+            f"[a0][a1]amix=inputs=2:duration=longest:normalize=0[a]"
         )
         audio_map = ["-map", "[a]"]
         acopy = ["-c:a", "aac", "-b:a", "192k"]
     elif has_extra:
-        # Source is silent — extra is the only audio.
-        audio_chain = f";[2:a]volume={extra_volume:.3f}[a]"
+        # Source is silent — extra is the only audio. Pad with trailing
+        # silence so the audio stream lasts as long as the video; otherwise
+        # ffmpeg closes its output (and the stdin PNG pipe) the moment
+        # extra runs out, killing the renderer mid-encode.
+        audio_chain = f";[2:a]volume={extra_volume:.3f},apad[a]"
         audio_map = ["-map", "[a]"]
         acopy = ["-c:a", "aac", "-b:a", "192k"]
     elif source_has_audio and needs_audio_encode:
@@ -231,7 +275,8 @@ def _ffmpeg_cmd_video(
         "-i", "pipe:0",
     ]
     if has_extra:
-        if trim_duration is not None and trim_duration > 0.0:
+        # In loop mode the extra audio drives total length — do not cap it.
+        if not loop_active and trim_duration is not None and trim_duration > 0.0:
             cmd += ["-t", f"{trim_duration:.3f}"]
         cmd += ["-i", str(extra_audio)]
     cmd += [
@@ -340,6 +385,7 @@ def render_export(
     extra_volume: float = 1.0,
     watermark: bool = False,
     source_has_audio: bool = True,
+    loop_total_duration: float | None = None,
 ) -> None:
     """Synchronous entry. Runs Playwright frame capture + ffmpeg pipe.
 
@@ -372,6 +418,7 @@ def render_export(
             source_volume=source_volume,
             extra_audio=extra_audio, extra_volume=extra_volume,
             source_has_audio=source_has_audio,
+            loop_total_duration=loop_total_duration,
         )
     log.info("renderer.ffmpeg cmd=%s", shlex.join(cmd))
 
@@ -387,13 +434,24 @@ def render_export(
     assert proc.stdin is not None
 
     frames_written = {"n": 0}
+    pipe_closed = {"v": False}
 
     def on_frame(png: bytes) -> None:
+        # Once ffmpeg has closed its stdin (e.g. it hit -shortest because
+        # one of the audio streams was shorter than the video), every further
+        # write raises BrokenPipeError. That's not a render failure — the
+        # encoder finished cleanly with whatever frames we already piped.
+        # Mark the pipe as closed and drop subsequent frames silently;
+        # `_capture_frames` reads the flag (via `pipe_closed`) and stops the
+        # Chromium loop early so we don't spend extra seconds rendering PNGs
+        # that go nowhere.
+        if pipe_closed["v"]:
+            return
         try:
             proc.stdin.write(png)
             frames_written["n"] += 1
-        except BrokenPipeError:
-            raise
+        except (BrokenPipeError, ValueError):
+            pipe_closed["v"] = True
 
     async def _drive() -> int:
         return await _capture_frames(
@@ -411,8 +469,14 @@ def render_export(
     err_tail = ""
     try:
         total = asyncio.run(_drive())
-        proc.stdin.close()
-        log.info("renderer.frames piped=%d total=%d — waiting for ffmpeg mux", frames_written["n"], total)
+        try:
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        log.info(
+            "renderer.frames piped=%d total=%d pipe_closed_early=%s — waiting for ffmpeg mux",
+            frames_written["n"], total, pipe_closed["v"],
+        )
         proc.wait()
         log.info("renderer.ffmpeg exit=%d", proc.returncode)
     except Exception:

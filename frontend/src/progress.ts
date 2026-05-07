@@ -43,6 +43,47 @@ export function openProgressWs(jobId: string): Promise<WebSocket> {
         return;
       }
 
+      // Extra-track transcription mirrors the source-track flow above. The
+      // backend re-tags every event with an `extra_` prefix so we can route
+      // it into segmentsExtra without confusing the source progress bar.
+      if (msg?.phase === "extra_segment" && msg.segment && typeof msg.index === "number") {
+        store.appendExtraSegment(msg.segment, msg.index);
+        if (typeof msg.percent === "number") {
+          store.setProgress("transcribe", Math.max(0, Math.min(99, msg.percent)));
+        }
+        store.setExtraSubsStreaming(true);
+        return;
+      }
+
+      if (msg?.phase === "extra_transcribe") {
+        // Pure progress tick (no segment payload). Surface via the global
+        // progress bar so the user sees something is happening even before
+        // the first segment lands.
+        if (typeof msg.percent === "number") {
+          store.setProgress("transcribe", Math.max(0, Math.min(99, msg.percent)));
+        }
+        store.setExtraSubsStreaming(true);
+        return;
+      }
+
+      if (msg?.phase === "extra_transcribe_done") {
+        store.setExtraSubsStreaming(false);
+        store.setJobId(null);
+        store.setProgress("done", 100);
+        setTimeout(() => ws.close(), 100);
+        return;
+      }
+
+      if (
+        msg?.phase === "extra_transcribe_cancelled" ||
+        msg?.phase === "extra_transcribe_error"
+      ) {
+        store.setExtraSubsStreaming(false);
+        store.setJobId(null);
+        setTimeout(() => ws.close(), 100);
+        return;
+      }
+
       // URL-import: yt-dlp finished pulling bytes. Leave bar as-is; Uploader
       // will flip to "Transcribing…" once the POST /api/fetch-url returns.
       if (msg?.phase === "download_done") return;

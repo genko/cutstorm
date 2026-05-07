@@ -136,6 +136,9 @@ class Trim(BaseModel):
     """Keep-range for the edges of the clip. `out_sec==0` means "to end"."""
     in_sec: float = Field(default=0.0, ge=0.0)
     out_sec: float = Field(default=0.0, ge=0.0)
+    # When true and an extra audio track is provided, the [in_sec..out_sec]
+    # slice is looped to cover the extra audio's duration (Coub-style).
+    loop: bool = False
 
     @model_validator(mode="after")
     def _bounds(self) -> "Trim":
@@ -152,6 +155,9 @@ class AudioMix(BaseModel):
     extra_volume: float = Field(default=1.0, ge=0.0, le=2.0)
 
 
+SubtitleTrack = Literal["source", "extra"]
+
+
 class ProjectState(BaseModel):
     """Full editor state that should survive a reload and be restored when
     reopening a project from the Sidebar. Cosmetic / editorial fields only —
@@ -165,6 +171,10 @@ class ProjectState(BaseModel):
     use_subs: bool | None = None
     display_mode: str | None = None
     updated_at: float | None = None
+    # Persisted alongside the source transcript so reloading a Coub-style
+    # project shows both subtitle tracks.
+    extra_segments: list[Segment] | None = None
+    subtitle_track: SubtitleTrack | None = None
 
 
 UpdateSegmentsRequest.model_rebuild()
@@ -196,6 +206,13 @@ class ExportRequest(BaseModel):
     format: ExportFormat = "mp4"
     gif_quality: GifQuality = "medium"
     watermark: bool = True
+    # Which transcript drives burned-in subtitles. "source" = whisper on the
+    # original video; "extra" = whisper on the uploaded extra audio track.
+    # The caller pre-resolves `segments` to the chosen track's timings; this
+    # flag controls expansion under trim.loop=true (source segments need
+    # repetition across each loop iteration, extra segments ride the master
+    # extra-audio timeline as-is).
+    subtitle_track: SubtitleTrack = "source"
 
 
 class ExportResponse(BaseModel):
