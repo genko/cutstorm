@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import time
 from contextlib import asynccontextmanager
@@ -51,6 +52,10 @@ from .transcribe import _get_fw_model, probe, transcribe, transcribe_stream
 UPLOADS_DIR = Path(os.environ.get("UPLOADS_DIR", "/data/uploads"))
 OUTPUTS_DIR = Path(os.environ.get("OUTPUTS_DIR", "/data/outputs"))
 MODELS_DIR = Path(os.environ.get("MODELS_DIR", "/data/models"))
+# Admin-managed source of pre-placed media, e.g. a symlink the server admin
+# points at some other mount. Read-only from the app's perspective — files
+# are copied (never moved/deleted) when imported. May not exist.
+SERVER_DIR = Path(os.environ.get("SERVER_DIR", "/data/server"))
 STATIC_DIR = Path(os.environ.get("STATIC_DIR", "/app/static"))
 FONTS_DIR = Path(os.environ.get("FONTS_DIR", "/usr/share/fonts/cutstorm"))
 FONTS_MANIFEST = Path(os.environ.get("FONTS_MANIFEST", "/opt/cutstorm/fonts-src/manifest.json"))
@@ -704,18 +709,10 @@ async def api_transcribe(
     )
 
 
-@app.get("/api/import-candidates", response_model=list[ImportCandidate])
-def list_import_candidates() -> list[ImportCandidate]:
-    """List media files sitting directly in UPLOADS_DIR that were placed
-    there outside the app — e.g. copied straight into the mounted /data
-    volume — rather than through /api/transcribe or /api/fetch-url. A file
-    counts as \"not yet imported\" if it has no matching {video_id}.json
-    meta file. Lets the start screen offer 'select an existing file on the
-    server' as a third ingest path alongside upload and URL import."""
-    owned_meta = {p.stem for p in UPLOADS_DIR.glob("*.json")}
+def _scan_import_candidates(directory: Path, source: str, owned_meta: set[str]) -> list[ImportCandidate]:
     out: list[ImportCandidate] = []
     try:
-        for p in UPLOADS_DIR.iterdir():
+        for p in directory.iterdir():
             if not p.is_file():
                 continue
             name = p.name
@@ -734,6 +731,7 @@ def list_import_candidates() -> list[ImportCandidate]:
             stat = p.stat()
             out.append(ImportCandidate(
                 filename=name,
+                source=source,
                 size_bytes=stat.st_size,
                 duration=info.duration,
                 width=info.width,
@@ -742,7 +740,25 @@ def list_import_candidates() -> list[ImportCandidate]:
                 mtime=stat.st_mtime,
             ))
     except Exception as exc:  # pragma: no cover
-        log.warning("import_candidates.list_failed err=%s", exc)
+        log.warning("import_candidates.list_failed dir=%s err=%s", directory, exc)
+    return out
+
+
+@app.get("/api/import-candidates", response_model=list[ImportCandidate])
+def list_import_candidates() -> list[ImportCandidate]:
+    """List media files that can be adopted without going through
+    /api/transcribe or /api/fetch-url: files sitting directly in
+    UPLOADS_DIR (e.g. copied straight into the mounted /data volume) plus
+    anything under SERVER_DIR (an admin-managed, typically read-only
+    directory — e.g. a symlink the server admin points at another mount).
+    A file counts as \"not yet imported\" if it has no matching
+    {video_id}.json meta file. Lets the start screen offer 'select an
+    existing file on the server' as a third ingest path alongside upload
+    and URL import."""
+    owned_meta = {p.stem for p in UPLOADS_DIR.glob("*.json")}
+    out = _scan_import_candidates(UPLOADS_DIR, "uploads", owned_meta)
+    if SERVER_DIR.is_dir():
+        out += _scan_import_candidates(SERVER_DIR, "server", owned_meta)
     out.sort(key=lambda x: x.mtime, reverse=True)
     return out
 
@@ -753,23 +769,27 @@ async def api_import_existing(
     job_id: str | None = Query(default=None),
     x_job_id: str | None = Header(default=None),
 ) -> TranscribeResponse:
-    """Adopt a media file that already exists in UPLOADS_DIR — e.g. one
-    copied directly into the mounted /data volume — without going through
-    the upload or URL-import endpoints. Runs the same post-ingest flow as
-    /api/transcribe: hash → dedup → probe → optional whisper."""
+    """Adopt a media file that already exists in UPLOADS_DIR or SERVER_DIR
+    — e.g. one copied directly into the mounted /data volume, or one
+    placed by the server admin under the admin-managed SERVER_DIR —
+    without going through the upload or URL-import endpoints. Runs the
+    same post-ingest flow as /api/transcribe: hash → dedup → probe →
+    optional whisper."""
     jid = job_id or x_job_id
     name = _sanitize_bare_filename(req.filename)
     ext = _ext_from_filename(name)
+    from_server = req.source == "server"
+    base_dir = SERVER_DIR if from_server else UPLOADS_DIR
 
-    src = UPLOADS_DIR / name
+    src = base_dir / name
     if not src.is_file():
         raise HTTPException(status_code=404, detail="file not found")
     if _meta_path(src.stem).exists():
         raise HTTPException(status_code=409, detail="file already imported")
 
     log.info(
-        "import_existing.request filename=%r language=%s model=%s generate_subs=%s job_id=%s",
-        name, req.language, req.model, req.generate_subs, jid,
+        "import_existing.request filename=%r source=%s language=%s model=%s generate_subs=%s job_id=%s",
+        name, req.source, req.language, req.model, req.generate_subs, jid,
     )
 
     # Route through a private .incoming- name first, exactly like a fresh
@@ -779,7 +799,12 @@ async def api_import_existing(
     # name — and keeps the dedup-delete behavior on a duplicate-content hit
     # identical to the upload path.
     tmp = UPLOADS_DIR / f".incoming-{os.getpid()}-{id(req)}"
-    src.rename(tmp)
+    if from_server:
+        # SERVER_DIR is admin-managed and may be read-only or shared —
+        # never move or delete from it, only copy.
+        shutil.copyfile(src, tmp)
+    else:
+        src.rename(tmp)
     try:
         return _finalize_uploaded_media(
             tmp_path=tmp,
@@ -792,7 +817,10 @@ async def api_import_existing(
         )
     except Exception:
         if tmp.exists():
-            tmp.rename(src)
+            if from_server:
+                tmp.unlink(missing_ok=True)
+            else:
+                tmp.rename(src)
         raise
 
 

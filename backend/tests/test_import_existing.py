@@ -13,6 +13,16 @@ client = TestClient(app)
 
 
 @pytest.fixture
+def fresh_server(tmp_path, monkeypatch):
+    """Point SERVER_DIR at a clean tmp dir simulating the admin-managed
+    symlink under data/server."""
+    server = tmp_path / "server"
+    server.mkdir()
+    monkeypatch.setattr(app_main, "SERVER_DIR", server)
+    return server
+
+
+@pytest.fixture
 def fresh_uploads(tmp_path, monkeypatch):
     """Point UPLOADS_DIR/OUTPUTS_DIR at a clean tmp so fixture writes don't
     leak across tests."""
@@ -61,6 +71,25 @@ def test_import_candidates_ignores_non_media_files(fresh_uploads: Path) -> None:
     assert client.get("/api/import-candidates").json() == []
 
 
+def test_import_candidates_lists_server_dir_file(
+    fresh_uploads: Path, fresh_server: Path, sample_video: Path,
+) -> None:
+    shutil.copyfile(sample_video, fresh_server / "admin.mp4")
+    r = client.get("/api/import-candidates")
+    assert r.status_code == 200
+    items = r.json()
+    assert len(items) == 1
+    assert items[0]["filename"] == "admin.mp4"
+    assert items[0]["source"] == "server"
+
+
+def test_import_candidates_missing_server_dir_ok(fresh_uploads: Path, monkeypatch) -> None:
+    # SERVER_DIR is admin-managed and may not exist (symlink not yet
+    # created) — listing must not error.
+    monkeypatch.setattr(app_main, "SERVER_DIR", Path("/no/such/dir"))
+    assert client.get("/api/import-candidates").json() == []
+
+
 # ---------- POST /api/import-existing ----------
 
 
@@ -84,6 +113,34 @@ def test_import_existing_adopts_file(fresh_uploads: Path, sample_video: Path) ->
     assert client.get("/api/import-candidates").json() == []
     ids = [t["video_id"] for t in client.get("/api/transcripts").json()]
     assert body["video_id"] in ids
+
+
+def test_import_existing_from_server_dir_copies_not_moves(
+    fresh_uploads: Path, fresh_server: Path, sample_video: Path,
+) -> None:
+    shutil.copyfile(sample_video, fresh_server / "admin.mp4")
+    r = client.post(
+        "/api/import-existing",
+        json={"filename": "admin.mp4", "source": "server", "generate_subs": False},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["video_id"]
+    # Admin's file is left in place — never moved or deleted.
+    assert (fresh_server / "admin.mp4").exists()
+    assert (fresh_uploads / f"{body['video_id']}.mp4").exists()
+    ids = [t["video_id"] for t in client.get("/api/transcripts").json()]
+    assert body["video_id"] in ids
+
+
+def test_import_existing_from_server_dir_unknown_file_404(
+    fresh_uploads: Path, fresh_server: Path,
+) -> None:
+    r = client.post(
+        "/api/import-existing",
+        json={"filename": "nope.mp4", "source": "server"},
+    )
+    assert r.status_code == 404
 
 
 @pytest.mark.parametrize("bad", ["../etc/passwd", "a/b.mp4", "a\\b.mp4", "..", "."])

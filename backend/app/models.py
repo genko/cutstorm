@@ -75,11 +75,17 @@ class FetchUrlRequest(BaseModel):
     generate_subs: bool = True
 
 
+ImportSource = Literal["uploads", "server"]
+
+
 class ImportCandidate(BaseModel):
-    """A media file sitting directly in UPLOADS_DIR that was placed there
-    outside the app (e.g. copied into the mounted /data volume) and has not
-    yet been imported (no matching {video_id}.json meta file)."""
+    """A media file that was placed outside the app and has not yet been
+    imported (no matching {video_id}.json meta file). Either sitting
+    directly in UPLOADS_DIR (e.g. copied into the mounted /data volume) or
+    under SERVER_DIR (an admin-managed directory, e.g. a symlink the
+    server admin points at another mount)."""
     filename: str
+    source: ImportSource = "uploads"
     size_bytes: int
     duration: float
     width: int
@@ -90,6 +96,7 @@ class ImportCandidate(BaseModel):
 
 class ImportExistingRequest(BaseModel):
     filename: str = Field(..., min_length=1, max_length=255)
+    source: ImportSource = "uploads"
     language: str | None = "ru"
     model: str | None = None
     generate_subs: bool = True

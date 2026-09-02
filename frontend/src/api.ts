@@ -136,8 +136,11 @@ export function videoUrl(videoId: string): string {
   return `${API_BASE}/api/video/${videoId}`;
 }
 
+export type ImportSource = "uploads" | "server";
+
 export type ImportCandidate = {
   filename: string;
+  source: ImportSource;
   size_bytes: number;
   duration: number;
   width: number;
@@ -146,9 +149,11 @@ export type ImportCandidate = {
   mtime: number;
 };
 
-/** Media files sitting directly in UPLOADS_DIR (e.g. copied straight into
- * the mounted /data volume) that haven't been imported through the app yet
- * — i.e. have no matching {video_id}.json meta file. */
+/** Media files that haven't been imported through the app yet — i.e. have
+ * no matching {video_id}.json meta file. Covers files sitting directly in
+ * UPLOADS_DIR (e.g. copied straight into the mounted /data volume) as well
+ * as anything under SERVER_DIR, an admin-managed directory (e.g. a symlink
+ * the server admin points at another mount). */
 export async function listImportCandidates(): Promise<ImportCandidate[]> {
   const res = await fetch(`${API_BASE}/api/import-candidates`);
   if (!res.ok) throw new Error(`list failed: ${res.status}`);
@@ -157,6 +162,7 @@ export async function listImportCandidates(): Promise<ImportCandidate[]> {
 
 export async function importExisting(
   filename: string,
+  source: ImportSource,
   opts: {
     language?: string;
     model?: string;
@@ -173,6 +179,7 @@ export async function importExisting(
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       filename,
+      source,
       language: opts.language,
       model: opts.model,
       generate_subs: opts.generateSubs !== false,

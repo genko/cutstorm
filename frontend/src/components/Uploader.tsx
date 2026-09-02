@@ -4,6 +4,7 @@ import {
   fetchVideoFromUrl,
   importExisting,
   ImportCandidate,
+  ImportSource,
   listImportCandidates,
   uploadVideo,
   videoUrl,
@@ -179,7 +180,7 @@ export function Uploader() {
     }
   }
 
-  async function doImportExisting(filename: string) {
+  async function doImportExisting(filename: string, source: ImportSource) {
     setBusy("uploading");
     setError(null);
     setProgress("import", 0);
@@ -193,7 +194,7 @@ export function Uploader() {
     abortRef.current = ctrl;
 
     try {
-      const result = await importExisting(filename, {
+      const result = await importExisting(filename, source, {
         jobId,
         language,
         model,
@@ -384,13 +385,18 @@ export function Uploader() {
             <div className="existing-import-list">
               {existing.map((it) => (
                 <button
-                  key={it.filename}
+                  key={`${it.source}-${it.filename}`}
                   type="button"
                   className="sidebar-item"
-                  onClick={() => void doImportExisting(it.filename)}
+                  onClick={() => void doImportExisting(it.filename, it.source)}
                   data-testid={`existing-item-${it.filename}`}
                 >
-                  <div className="sidebar-item-title">{it.filename}</div>
+                  <div className="sidebar-item-title">
+                    {it.source === "server" && (
+                      <span className="sidebar-item-tag">server</span>
+                    )}
+                    {it.filename}
+                  </div>
                   <div className="sidebar-item-meta">
                     <span>{fmtCandidateDuration(it.duration)}</span>
                     <span>·</span>
