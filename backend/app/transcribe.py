@@ -20,6 +20,7 @@ class ProbeInfo:
     height: int
     is_audio_only: bool = False
     has_audio: bool = True
+    video_codec: str | None = None
 
 
 def probe(video: Path) -> ProbeInfo:
@@ -27,7 +28,7 @@ def probe(video: Path) -> ProbeInfo:
         [
             "ffprobe",
             "-v", "error",
-            "-show_entries", "stream=codec_type,width,height:format=duration",
+            "-show_entries", "stream=codec_type,codec_name,width,height:format=duration",
             "-of", "json",
             str(video),
         ],
@@ -51,6 +52,7 @@ def probe(video: Path) -> ProbeInfo:
         height=int(vid.get("height", 0)),
         is_audio_only=False,
         has_audio=aud is not None,
+        video_codec=vid.get("codec_name"),
     )
 
 

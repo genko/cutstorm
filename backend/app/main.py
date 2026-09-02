@@ -130,6 +130,12 @@ def _sweep_orphans() -> dict:
             if _VIDEO_ID_RE.match(mp4.stem) and mp4.stem not in owned_meta:
                 mp4.unlink()
                 counts["outputs"] += 1
+        for preview in OUTPUTS_DIR.glob("preview_*.mp4"):
+            # filename: preview_{video_id}.mp4
+            vid = preview.stem[len("preview_"):]
+            if _VIDEO_ID_RE.match(vid) and vid not in owned_meta:
+                preview.unlink()
+                counts["outputs"] += 1
         for ass in OUTPUTS_DIR.glob("*.ass"):
             if _VIDEO_ID_RE.match(ass.stem) and ass.stem not in owned_meta:
                 ass.unlink()
@@ -386,6 +392,42 @@ def _output_path(video_id: str) -> Path:
 
 def _gif_output_path(video_id: str) -> Path:
     return OUTPUTS_DIR / f"{video_id}.gif"
+
+
+# Codecs that browsers can decode natively in a plain <video> element.
+# Anything else (hevc/h265, mpeg4, prores, ...) needs a transcoded proxy for
+# the interactive preview — the original file is still used, untouched, for
+# thumbnails and final export.
+_BROWSER_SAFE_VIDEO_CODECS = {"h264", "vp8", "vp9", "av1"}
+
+
+def _preview_proxy_path(video_id: str) -> Path:
+    return OUTPUTS_DIR / f"preview_{video_id}.mp4"
+
+
+def _ensure_preview_proxy(media: Path, video_id: str) -> Path:
+    """Return a browser-playable H.264 stand-in for `media`, transcoding and
+    caching it in OUTPUTS_DIR on first request. The original file is never
+    modified."""
+    dst = _preview_proxy_path(video_id)
+    if dst.exists():
+        return dst
+    tmp = OUTPUTS_DIR / f".preview-{video_id}-{os.getpid()}.mp4"
+    cmd = [
+        "ffmpeg", "-y", "-nostats", "-loglevel", "error",
+        "-i", str(media),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "160k",
+        "-movflags", "+faststart",
+        str(tmp),
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+        tmp.rename(dst)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return dst
 
 
 _GIF_PRESETS: dict[str, dict[str, str | int]] = {
@@ -1225,6 +1267,10 @@ def delete_transcript(video_id: str, drop_video: bool = False) -> dict:
     if ass.exists():
         ass.unlink()
         removed.append("ass")
+    preview = _preview_proxy_path(video_id)
+    if preview.exists():
+        preview.unlink()
+        removed.append("preview")
 
     # Thumbnail sprite sheets — multiple possible per video (different
     # count/width combos are generated on demand by the timeline).
@@ -1353,6 +1399,25 @@ def api_video(video_id: str) -> FileResponse:
     path = _find_media_file(video_id)
     if path is None:
         raise HTTPException(status_code=404, detail="video not found")
+
+    # Some sources (4K phone/drone/camera footage in particular) are HEVC or
+    # another codec plain <video> can't decode client-side — ffmpeg can read
+    # them fine (that's how thumbnails work), but the browser can't. Serve a
+    # cached H.264 proxy instead in that case; the original stays untouched
+    # for thumbnails/export.
+    try:
+        info = probe(path)
+    except Exception as exc:
+        log.warning("video.probe_failed id=%s err=%s", video_id, exc)
+        info = None
+    if info is not None and not info.is_audio_only and info.video_codec not in _BROWSER_SAFE_VIDEO_CODECS:
+        try:
+            path = _ensure_preview_proxy(path, video_id)
+        except Exception as exc:
+            log.warning("video.proxy_failed id=%s err=%s", video_id, exc)
+            # Fall back to serving the original rather than erroring out —
+            # some browsers/codecs may still partially work.
+
     ext = path.suffix.lstrip(".").lower()
     mime = _MIME_BY_EXT.get(ext, "application/octet-stream")
     return FileResponse(path, media_type=mime)
