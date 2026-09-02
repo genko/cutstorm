@@ -136,6 +136,62 @@ export function videoUrl(videoId: string): string {
   return `${API_BASE}/api/video/${videoId}`;
 }
 
+export type ImportCandidate = {
+  filename: string;
+  size_bytes: number;
+  duration: number;
+  width: number;
+  height: number;
+  is_audio_only: boolean;
+  mtime: number;
+};
+
+/** Media files sitting directly in UPLOADS_DIR (e.g. copied straight into
+ * the mounted /data volume) that haven't been imported through the app yet
+ * — i.e. have no matching {video_id}.json meta file. */
+export async function listImportCandidates(): Promise<ImportCandidate[]> {
+  const res = await fetch(`${API_BASE}/api/import-candidates`);
+  if (!res.ok) throw new Error(`list failed: ${res.status}`);
+  return res.json();
+}
+
+export async function importExisting(
+  filename: string,
+  opts: {
+    language?: string;
+    model?: string;
+    generateSubs?: boolean;
+    jobId?: string;
+    signal?: AbortSignal;
+  } = {},
+): Promise<TranscribeResult> {
+  const endpoint = opts.jobId
+    ? `${API_BASE}/api/import-existing?job_id=${encodeURIComponent(opts.jobId)}`
+    : `${API_BASE}/api/import-existing`;
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      filename,
+      language: opts.language,
+      model: opts.model,
+      generate_subs: opts.generateSubs !== false,
+    }),
+    signal: opts.signal,
+  });
+  if (!res.ok) {
+    let detail = "";
+    try {
+      const j = await res.json();
+      detail = j?.detail ?? "";
+    } catch {
+      detail = await res.text();
+    }
+    throw new Error(detail || `import-existing failed: ${res.status}`);
+  }
+  return res.json();
+}
+
 export type ExportFormat = "mp4" | "gif";
 export type GifQuality = "low" | "medium" | "high";
 

@@ -75,6 +75,26 @@ class FetchUrlRequest(BaseModel):
     generate_subs: bool = True
 
 
+class ImportCandidate(BaseModel):
+    """A media file sitting directly in UPLOADS_DIR that was placed there
+    outside the app (e.g. copied into the mounted /data volume) and has not
+    yet been imported (no matching {video_id}.json meta file)."""
+    filename: str
+    size_bytes: int
+    duration: float
+    width: int
+    height: int
+    is_audio_only: bool = False
+    mtime: float
+
+
+class ImportExistingRequest(BaseModel):
+    filename: str = Field(..., min_length=1, max_length=255)
+    language: str | None = "ru"
+    model: str | None = None
+    generate_subs: bool = True
+
+
 class TranscriptSummary(BaseModel):
     video_id: str
     original_filename: str | None = None

@@ -1,5 +1,13 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { cancelFetchUrl, fetchVideoFromUrl, uploadVideo, videoUrl } from "../api";
+import {
+  cancelFetchUrl,
+  fetchVideoFromUrl,
+  importExisting,
+  ImportCandidate,
+  listImportCandidates,
+  uploadVideo,
+  videoUrl,
+} from "../api";
 import { LANGUAGES, PINNED_LANGUAGES } from "../languages";
 import { newJobId, openProgressWs } from "../progress";
 import { useStore } from "../store";
@@ -9,6 +17,21 @@ const QUALITY = [
   { value: "small", label: "Fast (small)" },
   { value: "tiny", label: "Test (tiny)" },
 ];
+
+function fmtCandidateDuration(d: number): string {
+  if (!d || !Number.isFinite(d)) return "?";
+  const m = Math.floor(d / 60);
+  const s = Math.floor(d % 60);
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+function fmtCandidateSize(n: number): string {
+  if (!n || !Number.isFinite(n)) return "0 B";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 ** 2) return `${(n / 1024).toFixed(0)} KB`;
+  if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(1)} MB`;
+  return `${(n / 1024 ** 3).toFixed(2)} GB`;
+}
 
 export function Uploader() {
   const inputRef = useRef<HTMLInputElement>(null);
@@ -30,6 +53,24 @@ export function Uploader() {
   const [urlValue, setUrlValue] = useState("");
   const abortRef = useRef<AbortController | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const [existing, setExisting] = useState<ImportCandidate[]>([]);
+  const [existingLoading, setExistingLoading] = useState(false);
+
+  async function refreshExisting() {
+    setExistingLoading(true);
+    try {
+      const items = await listImportCandidates();
+      setExisting(items);
+    } catch (e) {
+      console.warn("list import candidates:", e);
+    } finally {
+      setExistingLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void refreshExisting();
+  }, []);
 
   async function doUpload(file: File) {
     setBusy("uploading");
@@ -129,6 +170,53 @@ export function Uploader() {
       }
       setBusy("idle");
       setProgress("idle", 0);
+    } finally {
+      abortRef.current = null;
+      if (!useStore.getState().subsStreaming) {
+        wsRef.current = null;
+        ws.close();
+      }
+    }
+  }
+
+  async function doImportExisting(filename: string) {
+    setBusy("uploading");
+    setError(null);
+    setProgress("import", 0);
+    setSubsStreaming(false);
+
+    const jobId = newJobId();
+    setJobId(jobId);
+    const ws = await openProgressWs(jobId);
+    wsRef.current = ws;
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+
+    try {
+      const result = await importExisting(filename, {
+        jobId,
+        language,
+        model,
+        generateSubs,
+        signal: ctrl.signal,
+      });
+      setUploaded({ ...result, url: videoUrl(result.video_id) });
+      setUseSubs(generateSubs);
+      if (generateSubs && result.segments.length === 0) {
+        setSubsStreaming(true);
+        setProgress("transcribe", 0);
+      } else {
+        setProgress("done", 100);
+      }
+    } catch (err) {
+      if ((err as Error).name === "AbortError") {
+        setError(null);
+      } else {
+        setError(err instanceof Error ? err.message : String(err));
+      }
+      setBusy("idle");
+      setProgress("idle", 0);
+      void refreshExisting();
     } finally {
       abortRef.current = null;
       if (!useStore.getState().subsStreaming) {
@@ -245,6 +333,8 @@ export function Uploader() {
                 ? "Downloading…"
                 : progressPhase === "upload"
                 ? "Uploading…"
+                : progressPhase === "import"
+                ? "Importing…"
                 : "Transcribing…"
               : "Drop a video or audio file or click to browse"}
           </div>
@@ -273,6 +363,49 @@ export function Uploader() {
           >
             Cancel
           </button>
+        )}
+
+        {!disabled && existing.length > 0 && (
+          <div className="existing-import" data-testid="existing-import">
+            <div className="existing-import-header">
+              <span className="existing-import-title">
+                Or import a file already on the server
+              </span>
+              <button
+                type="button"
+                className="link"
+                onClick={() => void refreshExisting()}
+                disabled={existingLoading}
+                data-testid="existing-import-refresh"
+              >
+                {existingLoading ? "Refreshing…" : "Refresh"}
+              </button>
+            </div>
+            <div className="existing-import-list">
+              {existing.map((it) => (
+                <button
+                  key={it.filename}
+                  type="button"
+                  className="sidebar-item"
+                  onClick={() => void doImportExisting(it.filename)}
+                  data-testid={`existing-item-${it.filename}`}
+                >
+                  <div className="sidebar-item-title">{it.filename}</div>
+                  <div className="sidebar-item-meta">
+                    <span>{fmtCandidateDuration(it.duration)}</span>
+                    <span>·</span>
+                    {!it.is_audio_only && (
+                      <>
+                        <span>{it.width}×{it.height}</span>
+                        <span>·</span>
+                      </>
+                    )}
+                    <span>{fmtCandidateSize(it.size_bytes)}</span>
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
         )}
 
         <div className="subs-settings" data-testid="subs-settings">

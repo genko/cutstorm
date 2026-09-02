@@ -43,6 +43,7 @@ export type ProgressPhase =
   | "idle"
   | "upload"
   | "download"
+  | "import"
   | "transcribe"
   | "align"
   | "encode"

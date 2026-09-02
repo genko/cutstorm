@@ -38,6 +38,8 @@ from .models import (
     ExportResponse,
     ExtraAudioResponse,
     FetchUrlRequest,
+    ImportCandidate,
+    ImportExistingRequest,
     Segment,
     TranscribeResponse,
     TranscriptSummary,
@@ -336,6 +338,16 @@ def _ext_from_filename(name: str | None) -> str:
     if ext not in _ALLOWED_EXTS:
         raise HTTPException(status_code=415, detail=f"unsupported file type: .{ext}")
     return ext
+
+
+def _sanitize_bare_filename(name: str) -> str:
+    """Reject anything that isn't a plain filename living directly in
+    UPLOADS_DIR — no path separators, no traversal, no hidden/incoming temp
+    files."""
+    name = name.strip()
+    if not name or name in (".", "..") or "/" in name or "\\" in name or name.startswith("."):
+        raise HTTPException(status_code=400, detail="invalid filename")
+    return name
 
 
 def _video_path(video_id: str, ext: str = "mp4") -> Path:
@@ -690,6 +702,98 @@ async def api_transcribe(
         generate_subs=generate_subs,
         jid=jid,
     )
+
+
+@app.get("/api/import-candidates", response_model=list[ImportCandidate])
+def list_import_candidates() -> list[ImportCandidate]:
+    """List media files sitting directly in UPLOADS_DIR that were placed
+    there outside the app — e.g. copied straight into the mounted /data
+    volume — rather than through /api/transcribe or /api/fetch-url. A file
+    counts as \"not yet imported\" if it has no matching {video_id}.json
+    meta file. Lets the start screen offer 'select an existing file on the
+    server' as a third ingest path alongside upload and URL import."""
+    owned_meta = {p.stem for p in UPLOADS_DIR.glob("*.json")}
+    out: list[ImportCandidate] = []
+    try:
+        for p in UPLOADS_DIR.iterdir():
+            if not p.is_file():
+                continue
+            name = p.name
+            if name.startswith(".") or name.startswith("extra_"):
+                continue
+            ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+            if ext not in _ALLOWED_EXTS:
+                continue
+            if p.stem in owned_meta:
+                continue  # already imported — surfaced via /api/transcripts instead
+            try:
+                info = probe(p)
+            except Exception as exc:
+                log.warning("import_candidates.probe_failed file=%s err=%s", name, exc)
+                continue
+            stat = p.stat()
+            out.append(ImportCandidate(
+                filename=name,
+                size_bytes=stat.st_size,
+                duration=info.duration,
+                width=info.width,
+                height=info.height,
+                is_audio_only=info.is_audio_only,
+                mtime=stat.st_mtime,
+            ))
+    except Exception as exc:  # pragma: no cover
+        log.warning("import_candidates.list_failed err=%s", exc)
+    out.sort(key=lambda x: x.mtime, reverse=True)
+    return out
+
+
+@app.post("/api/import-existing", response_model=TranscribeResponse)
+async def api_import_existing(
+    req: ImportExistingRequest,
+    job_id: str | None = Query(default=None),
+    x_job_id: str | None = Header(default=None),
+) -> TranscribeResponse:
+    """Adopt a media file that already exists in UPLOADS_DIR — e.g. one
+    copied directly into the mounted /data volume — without going through
+    the upload or URL-import endpoints. Runs the same post-ingest flow as
+    /api/transcribe: hash → dedup → probe → optional whisper."""
+    jid = job_id or x_job_id
+    name = _sanitize_bare_filename(req.filename)
+    ext = _ext_from_filename(name)
+
+    src = UPLOADS_DIR / name
+    if not src.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+    if _meta_path(src.stem).exists():
+        raise HTTPException(status_code=409, detail="file already imported")
+
+    log.info(
+        "import_existing.request filename=%r language=%s model=%s generate_subs=%s job_id=%s",
+        name, req.language, req.model, req.generate_subs, jid,
+    )
+
+    # Route through a private .incoming- name first, exactly like a fresh
+    # upload. This guarantees the temp path can never collide with the
+    # {video_id}.{ext} name _finalize_uploaded_media computes from the
+    # content hash — which *could* coincidentally be the file's own current
+    # name — and keeps the dedup-delete behavior on a duplicate-content hit
+    # identical to the upload path.
+    tmp = UPLOADS_DIR / f".incoming-{os.getpid()}-{id(req)}"
+    src.rename(tmp)
+    try:
+        return _finalize_uploaded_media(
+            tmp_path=tmp,
+            ext=ext,
+            filename=name,
+            language=req.language,
+            model=req.model,
+            generate_subs=req.generate_subs,
+            jid=jid,
+        )
+    except Exception:
+        if tmp.exists():
+            tmp.rename(src)
+        raise
 
 
 try:
